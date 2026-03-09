@@ -4,6 +4,14 @@
 
 It does **not** require changes to OpenClaw source code or upstream OpenClaw docs. It works by calling the deployed `openclaw` CLI and, for hook mode, by installing a managed internal hook into the deployment's existing state/config paths.
 
+## Process archive
+
+Historical implementation context for future maintainers/operators lives in:
+
+- `docs/archive/README.md`
+- `docs/archive/project-journey.md`
+- `docs/archive/operator-handoff.md`
+
 ## Install and run
 
 From a standalone checkout:
