@@ -1,0 +1,36 @@
+{
+  "name": "openclaw-phoenix",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Standalone OpenClaw backup watch and retention CLI",
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "bin": {
+    "openclaw-phoenix": "./dist/cli.js"
+  },
+  "scripts": {
+    "build": "tsc -p ./tsconfig.json && node ./scripts/postbuild.mjs",
+    "prepare": "npm run build",
+    "watch": "node --import tsx ./src/cli.ts watch",
+    "test": "vitest run --config ./vitest.config.ts",
+    "typecheck": "tsc -p ./tsconfig.typecheck.json --noEmit"
+  },
+  "dependencies": {
+    "chokidar": "^5.0.0",
+    "commander": "^14.0.3",
+    "json5": "^2.2.3",
+    "tar": "^7.5.1"
+  },
+  "devDependencies": {
+    "@types/node": "^25.3.5",
+    "tsx": "^4.21.0",
+    "typescript": "^5.9.3",
+    "vitest": "^4.0.18"
+  },
+  "engines": {
+    "node": ">=22.12.0"
+  }
+}
