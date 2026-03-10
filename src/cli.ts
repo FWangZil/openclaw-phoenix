@@ -16,6 +16,7 @@ import { DEFAULT_OPENCLAW_BIN, DEFAULT_OUTPUT_DIR, resolveOutputDir, resolveUser
 import { formatShellCommand, resolvePhoenixCommand } from "./phoenix-command.js";
 import { restoreBackupArchive } from "./restore.js";
 import { DEFAULT_DEBOUNCE_MS, DEFAULT_RETAIN, startBackupWatch } from "./watch.js";
+import { createPhoenixWebActionController } from "./web-actions.js";
 import { startPhoenixWebConsole } from "./web-console.js";
 import { buildPhoenixWebSnapshot } from "./web-contract.js";
 
@@ -227,7 +228,7 @@ async function main() {
   });
   const web = program
     .command("web")
-    .description("Structured read models and read-only local console for Phoenix");
+    .description("Structured read models and a local-first Phoenix web console");
   web
     .command("snapshot")
     .description("Print the current overview, timeline, config, and archive contract as JSON")
@@ -250,29 +251,38 @@ async function main() {
     });
   web
     .command("serve")
-    .description("Serve the local read-only Phoenix Web v1 console")
+    .description("Serve the local Phoenix Web console with low-risk manual actions")
     .option("--config <path>", "Override OPENCLAW_CONFIG_PATH when resolving Phoenix deployment paths")
+    .option("--openclaw-bin <path>", "Path to the deployed openclaw binary for browser-triggered actions", DEFAULT_OPENCLAW_BIN)
     .option("--output <dir>", "Directory for Phoenix backup archives and state", DEFAULT_OUTPUT_DIR)
     .option("--host <host>", "Host interface to bind for the local Phoenix console", "127.0.0.1")
     .option("--port <port>", "Port for the local Phoenix console (0 = random available port)", parsePort, 48789)
     .option(
       "--timeline-limit <count>",
-      "How many recent timeline entries to include in the read-only console",
+      "How many recent timeline entries to include in the Phoenix web console",
       (value) => parsePositiveInteger(value, "timeline-limit"),
       50,
     )
     .action(async (options) => {
+      const configPath = options.config ? resolveUserPath(options.config) : undefined;
+      const outputDir = resolveOutputDir(options.output);
       const server = await startPhoenixWebConsole({
         host: options.host,
         port: options.port,
+        actionController: createPhoenixWebActionController({
+          configPath,
+          openclawBin: options.openclawBin,
+          outputDir,
+          retain: DEFAULT_RETAIN,
+        }),
         loadSnapshot: async () => buildPhoenixWebSnapshot({
-          configPath: options.config ? resolveUserPath(options.config) : undefined,
+          configPath,
           env: process.env,
-          outputDir: resolveOutputDir(options.output),
+          outputDir,
           timelineLimit: options.timelineLimit,
         }),
       });
-      console.log(`Phoenix read-only console listening at ${server.url}`);
+      console.log(`Phoenix web console listening at ${server.url}`);
       console.log("Press Ctrl+C to stop.");
       let shuttingDown = false;
       const shutdown = async (signal: string) => {

@@ -25,7 +25,7 @@ const MAX_PHOENIX_WEB_HISTORY = 100;
 const DEFAULT_PHOENIX_RETAIN = 100;
 
 export type PhoenixWebOrigin = "watch" | "hook" | "manual";
-export type PhoenixWebOperation = "backup-cycle" | "recovery-cycle" | "restore";
+export type PhoenixWebOperation = "backup-cycle" | "recovery-cycle" | "restore" | "health-check";
 export type PhoenixWebActionStatus = "ok" | "warning" | "error";
 export type PhoenixWebNotificationMode = "off" | "exceptional-only" | "all";
 
@@ -366,6 +366,36 @@ function summarizeBackupCycleAction(backup: PhoenixWebBackupResult, retention: R
   return `Watch backup cycle created ${path.basename(backup.archivePath ?? "archive")}.${deletedSuffix}`.trim();
 }
 
+function summarizeBackupAction(options: {
+  origin: PhoenixWebOrigin;
+  backup: PhoenixWebBackupResult;
+  retention: RetentionResult;
+}): string {
+  if (options.origin === "watch") {
+    return summarizeBackupCycleAction(options.backup, options.retention);
+  }
+  if (options.backup.error) {
+    return `Manual backup failed: ${options.backup.error}`;
+  }
+  const deletedSuffix = options.retention.deleted.length > 0 ? ` Retention pruned ${options.retention.deleted.length} archive(s).` : "";
+  return `Manual backup created ${path.basename(options.backup.archivePath ?? "archive")}.${deletedSuffix}`.trim();
+}
+
+function summarizeHealthCheckAction(options: {
+  origin: PhoenixWebOrigin;
+  health: PhoenixWebHealthResult;
+  status: PhoenixWebActionStatus;
+}): string {
+  const originLabel = toOriginLabel(options.origin);
+  if (options.status === "error") {
+    return `${originLabel} health check failed: ${options.health.reason ?? "No reason recorded"}`;
+  }
+  if (options.health.healthy) {
+    return `${originLabel} health check reported healthy status${options.health.reason ? ` (${options.health.reason})` : ""}.`;
+  }
+  return `${originLabel} health check reported unhealthy status${options.health.reason ? ` (${options.health.reason})` : ""}.`;
+}
+
 function summarizeRestoreAction(options: {
   dryRun: boolean;
   archivePath: string;
@@ -466,15 +496,42 @@ export async function recordPhoenixBackupWatchAction(options: {
   backup: PhoenixWebBackupResult;
   retention: RetentionResult;
 }): Promise<PhoenixActionResult> {
+  return recordPhoenixBackupAction({
+    origin: "watch",
+    configPath: options.configPath,
+    outputDir: options.outputDir,
+    retain: options.retain,
+    startedAt: options.startedAt,
+    finishedAt: options.finishedAt,
+    backup: options.backup,
+    retention: options.retention,
+  });
+}
+
+export async function recordPhoenixBackupAction(options: {
+  origin?: PhoenixWebOrigin;
+  configPath?: string;
+  outputDir: string;
+  retain: number;
+  startedAt: string;
+  finishedAt: string;
+  backup: PhoenixWebBackupResult;
+  retention: RetentionResult;
+}): Promise<PhoenixActionResult> {
+  const origin = options.origin ?? "manual";
   const action: PhoenixActionResult = {
     schemaVersion: 1,
     id: randomUUID(),
-    origin: "watch",
+    origin,
     operation: "backup-cycle",
     status: classifyBackupCycleStatus(options.backup),
     startedAt: options.startedAt,
     finishedAt: options.finishedAt,
-    summary: summarizeBackupCycleAction(options.backup, options.retention),
+    summary: summarizeBackupAction({
+      origin,
+      backup: options.backup,
+      retention: options.retention,
+    }),
     config: {
       configPath: options.configPath,
       outputDir: options.outputDir,
@@ -484,6 +541,39 @@ export async function recordPhoenixBackupWatchAction(options: {
     },
     backup: options.backup,
     retention: options.retention,
+  };
+  return appendPhoenixAction(options.outputDir, action);
+}
+
+export async function recordPhoenixHealthCheckAction(options: {
+  origin?: PhoenixWebOrigin;
+  configPath?: string;
+  outputDir: string;
+  startedAt: string;
+  finishedAt: string;
+  status: PhoenixWebActionStatus;
+  health: PhoenixWebHealthResult;
+}): Promise<PhoenixActionResult> {
+  const origin = options.origin ?? "manual";
+  const action: PhoenixActionResult = {
+    schemaVersion: 1,
+    id: randomUUID(),
+    origin,
+    operation: "health-check",
+    status: options.status,
+    startedAt: options.startedAt,
+    finishedAt: options.finishedAt,
+    summary: summarizeHealthCheckAction({
+      origin,
+      health: options.health,
+      status: options.status,
+    }),
+    config: {
+      configPath: options.configPath,
+      outputDir: options.outputDir,
+      notification: summarizeNotificationConfig(undefined),
+    },
+    health: options.health,
   };
   return appendPhoenixAction(options.outputDir, action);
 }

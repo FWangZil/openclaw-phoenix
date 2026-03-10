@@ -56,9 +56,9 @@ node dist/cli.js --help
 - `openclaw-phoenix hook run`
   - Internal command used by the installed hook to run backup → health check → rollback/retain.
 - `openclaw-phoenix web snapshot`
-  - Prints the current Web v1 backend contract JSON for overview, timeline, config, and archive summaries.
+  - Prints the current Web v1 backend contract JSON for `overview`, `timeline`, `config`, `archives`, and `setup`.
 - `openclaw-phoenix web serve`
-  - Serves a local read-only Phoenix console with Overview, Setup, Activity, Archives, and Configuration views.
+  - Serves a local-first Phoenix console with Overview, Setup, Activity, Archives, and Configuration views plus explicit low-risk browser actions for `backup now` and `health check now`.
 - `openclaw-phoenix hook remove`
   - Removes only the Phoenix-managed hook entry and files.
 
@@ -346,13 +346,26 @@ It now also includes a stable nested `operation` object that preserves the run o
 
 ## Web/backend snapshot contract
 
+If you are running Phoenix from a source checkout, make sure `dist/` is current before using the web commands:
+
+```sh
+bun run build
+```
+
+`bun install` already does this through the package `prepare` script. Re-run `bun run build` after local source changes or when install scripts were skipped.
+
 Use `web snapshot` when you want a stable structured read model for a future local backend or web UI without parsing logs:
 
 ```sh
-openclaw-phoenix web snapshot --config ~/.openclaw/openclaw.json --output ~/openclaw-backups
+openclaw-phoenix web snapshot \
+  --config ~/.openclaw/openclaw.json \
+  --output ~/openclaw-backups \
+  > phoenix-web-snapshot.json
 ```
 
-The JSON snapshot includes four top-level sections:
+`web snapshot` writes JSON to stdout. Redirect it to a file, pipe it into `jq`, or let another local process read it directly.
+
+The JSON snapshot includes five top-level sections:
 
 - `overview`: latest action plus latest backup/health/rollback/notification/restore outcomes
 - `timeline`: recent structured actions with `origin` preserved as `watch`, `hook`, or `manual`
@@ -360,14 +373,11 @@ The JSON snapshot includes four top-level sections:
 - `archives`: known-good/last-backup pointers plus archive inventory with roles
 - `setup`: guided readiness checks for environment, output dir, retain count, self-heal, notifications, and preview commands
 
-Exit behavior:
+Exit behavior for `web snapshot` is read-model focused: Phoenix exits non-zero only when it cannot build the snapshot itself. An unhealthy deployment still produces a successful snapshot so the local console or another reader can explain what happened.
 
-- Healthy path: success requires a healthy status and no backup error.
-- Unhealthy path: success requires a successful rollback restore.
+## Local-first web console
 
-## Local read-only web console
-
-Use `web serve` when you want a browser view on top of the same structured snapshot contract without enabling restore, hook mutation, or config editing:
+Use `web serve` when you want a browser view on top of the same structured snapshot contract with only the lowest-risk explicit actions enabled. Phoenix still does not enable restore, hook mutation, or config editing in the browser:
 
 ```sh
 openclaw-phoenix web serve \
@@ -377,16 +387,32 @@ openclaw-phoenix web serve \
   --port 48789
 ```
 
-The local console is intentionally read-only in this slice:
+When the server starts it prints the listening URL and then waits until you stop it with `Ctrl+C`.
+
+Host/port behavior:
+
+- Default bind is `127.0.0.1:48789`, so Web v1 is local-only by default and intended to be opened from the same machine.
+- `--port 0` asks the OS for any free port; Phoenix prints the actual chosen URL after startup.
+- `--host 0.0.0.0` or a specific LAN interface makes the console reachable beyond loopback, but you should open it via that machine's actual hostname/IP rather than the literal `0.0.0.0` address.
+- Web v1 serves plain local HTTP and does not add browser-side auth or mutation controls. If you bind beyond loopback, put it behind your own access controls.
+
+The local console stays intentionally narrow in this slice:
 
 - `Overview` shows the current protection posture, watch mode, hook install state, latest results, and the latest known-good archive.
 - `Overview` now also explains why Phoenix currently looks healthy, limited, degraded, or failed; why rollback did or did not happen; why notifications did or did not fire; and when the browser view may be stale.
-- `Setup` shows guided prerequisite checks, required vs optional vs advanced settings, hard blockers vs warnings vs info, backup-only vs self-heal readiness, and preview commands you can run manually.
-- `Activity` shows recent Phoenix actions with explicit watch vs hook vs manual origin labels.
-- `Archives` shows the retained archive inventory plus latest-known-good and last-backup roles.
-- `Configuration` shows a read-only deployment/origin summary and any degraded or warning state.
+- `Overview` also provides two explicit local-only buttons: `Backup now` creates one fresh archive and applies Phoenix retention, while `Health check now` runs `openclaw status --json` and records a structured healthy/unhealthy result without restoring anything.
+- `Setup` shows guided prerequisite checks, required vs optional vs advanced settings, hard blockers vs warnings vs info, backup-only vs self-heal readiness, and preview commands you can copy into a terminal yourself.
+- `Activity` shows recent Phoenix actions with explicit watch vs hook vs manual origin labels, timestamps, config/output paths, and a short structured outcome summary.
+- `Archives` shows the retained archive inventory plus latest-known-good and last-backup roles, sizes, timestamps, and archive paths.
+- `Configuration` shows a read-only deployment summary plus last-known watch/hook origin settings, notification policy, and any degraded or warning state.
 
-If Phoenix has not recorded any activity yet, the console renders explicit empty states instead of assuming healthy data exists. The Setup page is also preview-only: it explains what command to run next, but the browser does not apply settings. The console also polls the snapshot endpoint to flag stale pages and offer a manual refresh prompt without mutating Phoenix state. If snapshot generation fails for a request, the console returns an explicit error page for that route.
+If Phoenix has not recorded any activity yet, the console renders explicit empty states instead of assuming healthy data exists. The Setup page is preview-only: it explains what command to run next, but the browser does not apply settings. The console also polls the snapshot endpoint to flag stale pages and offer a manual refresh prompt without mutating Phoenix state. If snapshot generation fails for a request, the console returns an explicit error page for that route.
+
+Current Web v1 boundary:
+
+- local-first: optimized for an operator already on the Phoenix host, with loopback binding as the default
+- low-risk only: the browser can inspect the current snapshot contract and `/api/snapshot`, and it may run only `backup now` or `health check now`; it does not run restore, install/remove hooks, edit config, or send notifications
+- guidance-focused: the browser explains readiness, state, and next-step commands, but you still perform real changes through the `openclaw-phoenix` CLI
 
 ## Notification behavior
 

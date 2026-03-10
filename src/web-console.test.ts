@@ -6,6 +6,7 @@ import {
   type PhoenixWebConsoleServer,
 } from "./web-console.js";
 import type { PhoenixWebSnapshot } from "./web-contract.js";
+import type { PhoenixWebActionController, PhoenixWebActionState } from "./web-actions.js";
 
 const servers: PhoenixWebConsoleServer[] = [];
 
@@ -73,6 +74,9 @@ describe("renderPhoenixWebConsolePage", () => {
     expect(overviewHtml).toContain("Data freshness");
     expect(overviewHtml).toContain("Browser checks for newer data every 15 second(s)");
     expect(overviewHtml).toContain("Refresh now");
+    expect(overviewHtml).toContain("Manual browser actions");
+    expect(overviewHtml).toContain("Run backup now");
+    expect(overviewHtml).toContain("Run health check now");
     expect(overviewHtml).toContain("No backup cycle has been recorded yet");
     expect(overviewHtml).toContain("No health check has been recorded yet");
     expect(activityHtml).toContain("Phoenix has not recorded any actions yet");
@@ -360,5 +364,45 @@ describe("startPhoenixWebConsole", () => {
     expect(body).toContain("Configuration unavailable");
     expect(body).toContain("snapshot load failed");
     expect(renderPhoenixWebConsoleErrorPage({ error: new Error("boom"), pathname: "/overview", view: "overview" })).toContain("Overview unavailable");
+  });
+
+  it("starts manual browser actions through the narrow action API", async () => {
+    let state: PhoenixWebActionState = {};
+    const actionController: PhoenixWebActionController = {
+      getState: () => state,
+      start: async (action) => {
+        state = {
+          running: {
+            id: "run-1",
+            action,
+            startedAt: "2026-03-10T12:00:00.000Z",
+          },
+        };
+        return { ok: true, state };
+      },
+    };
+    const server = await startPhoenixWebConsole({
+      host: "127.0.0.1",
+      port: 0,
+      actionController,
+      loadSnapshot: async () => buildSnapshot(),
+    });
+    servers.push(server);
+
+    const overview = await fetch(`${server.url}/overview`);
+    const startAction = await fetch(`${server.url}/api/actions/backup-now`, { method: "POST" });
+    const actionState = await fetch(`${server.url}/api/actions/state`);
+
+    expect(overview.status).toBe(200);
+    expect(await overview.text()).toContain("Manual browser actions");
+    expect(startAction.status).toBe(202);
+    expect(await startAction.json()).toMatchObject({
+      ok: true,
+      state: { running: { action: "backup-now" } },
+    });
+    expect(actionState.status).toBe(200);
+    expect(await actionState.json()).toMatchObject({
+      running: { action: "backup-now" },
+    });
   });
 });

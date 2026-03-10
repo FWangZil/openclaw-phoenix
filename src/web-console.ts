@@ -11,6 +11,7 @@ import type {
   PhoenixWebNotificationResult,
   PhoenixWebSnapshot,
 } from "./web-contract.js";
+import type { PhoenixWebActionController, PhoenixWebActionState, PhoenixWebManualAction } from "./web-actions.js";
 
 export type PhoenixConsoleView = "overview" | "setup" | "activity" | "archives" | "configuration";
 
@@ -23,6 +24,7 @@ export type PhoenixWebConsoleServer = {
 export type StartPhoenixWebConsoleOptions = {
   host?: string;
   port?: number;
+  actionController?: PhoenixWebActionController;
   loadSnapshot: () => Promise<PhoenixWebSnapshot>;
 };
 
@@ -122,7 +124,13 @@ function operationLabel(operation: PhoenixActionResult["operation"]): string {
     ? "Backup cycle"
     : operation === "recovery-cycle"
       ? "Recovery cycle"
-      : "Manual restore";
+      : operation === "health-check"
+        ? "Health check"
+        : "Manual restore";
+}
+
+function manualActionLabel(action: PhoenixWebManualAction): string {
+  return action === "backup-now" ? "Backup now" : "Health check now";
 }
 
 function protectionStateLabel(state: ProtectionStateLabel): string {
@@ -383,6 +391,10 @@ function buildMeaningfulOutcomeExplanation(snapshot: PhoenixWebSnapshot, protect
     if (latestHealth && latestHealth.operationId !== latestAction.id) {
       detail += ` The newest health verdict is still from ${formatDateTime(latestHealth.finishedAt)}, when Phoenix reported ${latestHealth.result.healthy ? "healthy" : "unhealthy"} status${latestHealth.result.reason ? ` (${latestHealth.result.reason})` : ""}.`;
     }
+  } else if (latestAction.operation === "health-check") {
+    detail = latestAction.health?.healthy
+      ? `Phoenix most recently ran a manual health check and the deployment reported healthy status${latestAction.health.reason ? ` (${latestAction.health.reason})` : ""}. This browser action did not create a backup or roll back live state.`
+      : `Phoenix most recently ran a manual health check and the deployment reported unhealthy status${latestAction.health?.reason ? ` (${latestAction.health.reason})` : ""}. This browser action recorded the result only; it did not restore live state.`;
   } else if (latestAction.operation === "restore") {
     detail = latestAction.restore?.error
       ? `Phoenix most recently attempted a manual restore, but it failed for ${basenameOrFallback(latestAction.restore.archivePath, "the selected archive")}: ${latestAction.restore.error}`
@@ -634,7 +646,84 @@ function renderLatestResultCard<T>(options: {
   );
 }
 
-function renderOverview(snapshot: PhoenixWebSnapshot): string {
+function renderManualActionState(actionState: PhoenixWebActionState | undefined): string {
+  if (actionState?.running) {
+    return renderCard(
+      "Browser action status",
+      `<p>Phoenix is currently running <strong>${escapeHtml(manualActionLabel(actionState.running.action))}</strong>.</p>
+       <dl class="details-grid">${renderKeyValueList([
+         { label: "State", value: statusBadge("Running", "warning") },
+         { label: "Started", value: escapeHtml(formatDateTime(actionState.running.startedAt)) },
+         { label: "Action", value: escapeHtml(manualActionLabel(actionState.running.action)) },
+       ])}</dl>
+       <p class="muted">The browser will refresh automatically when this action finishes so the latest structured Phoenix snapshot is visible.</p>`,
+      { tone: "warning", eyebrow: "Action in progress" },
+    );
+  }
+  if (!actionState?.lastCompleted) {
+    return renderEmptyCard(
+      "Browser action status",
+      "No browser-triggered Phoenix action has completed in this web session yet.",
+    );
+  }
+  const completed = actionState.lastCompleted;
+  const result = completed.actionResult;
+  const rows: KeyValueRow[] = [
+    { label: "Action", value: escapeHtml(manualActionLabel(completed.action)) },
+    { label: "Finished", value: escapeHtml(formatDateTime(completed.finishedAt)) },
+    { label: "Outcome", value: statusBadge(completed.status.toUpperCase(), toneForActionStatus(completed.status)) },
+  ];
+  if (result.operation === "backup-cycle") {
+    rows.push(
+      { label: "Archive", value: formatPath(result.backup?.archivePath) },
+      { label: "Error", value: result.backup?.error ? escapeHtml(result.backup.error) : "None", tone: result.backup?.error ? "error" : "ok" },
+      { label: "Retention pruned", value: escapeHtml(String(result.retention?.deleted.length ?? 0)) },
+    );
+  }
+  if (result.operation === "health-check") {
+    rows.push(
+      {
+        label: "Healthy",
+        value: escapeHtml(formatBoolean(result.health?.healthy, "Healthy", "Unhealthy")),
+        tone: result.health?.healthy ? "ok" : "error",
+      },
+      { label: "Reason", value: escapeHtml(result.health?.reason ?? "No reason recorded") },
+    );
+  }
+  return renderCard(
+    "Browser action status",
+    `<p>${escapeHtml(completed.summary)}</p><dl class="details-grid">${renderKeyValueList(rows)}</dl>`,
+    { tone: toneForActionStatus(completed.status), eyebrow: "Latest browser action" },
+  );
+}
+
+function renderManualActions(snapshot: PhoenixWebSnapshot, actionState: PhoenixWebActionState | undefined): string {
+  return `<section class="stack" data-manual-actions-root>
+    <div>
+      <h2>Manual browser actions</h2>
+      <p class="muted">These explicit local-only actions stay inside Phoenix's low-risk browser surface. They do not restore live files, mutate hooks, or edit configuration.</p>
+    </div>
+    <div class="cards cards--2">
+      ${renderCard(
+        "Backup now",
+        `<p>Create one fresh archive immediately and apply Phoenix retention in the configured output directory. This does not restore anything.</p>
+         <p class="muted">Current backup readiness: ${escapeHtml(snapshot.setup.backupReadiness.title)}.</p>
+         <button type="button" class="action-button" data-manual-action="backup-now">Run backup now</button>`,
+        { tone: toneForReadiness(snapshot.setup.backupReadiness.state) },
+      )}
+      ${renderCard(
+        "Health check now",
+        `<p>Run <code>openclaw status --json</code> and record a structured healthy/unhealthy result. This browser action does not roll back live state.</p>
+         <p class="muted">Use this when you want a fresh operator-visible health verdict without changing deployed files.</p>
+         <button type="button" class="action-button" data-manual-action="health-check-now">Run health check now</button>`,
+        { tone: "ok" },
+      )}
+    </div>
+    <div data-manual-action-feedback>${renderManualActionState(actionState)}</div>
+  </section>`;
+}
+
+function renderOverview(snapshot: PhoenixWebSnapshot, actionState?: PhoenixWebActionState): string {
   const protection = deriveProtectionState(snapshot);
   const watchConfig = snapshot.config.origins.watch;
   const hookConfig = snapshot.config.origins.hook;
@@ -655,6 +744,7 @@ function renderOverview(snapshot: PhoenixWebSnapshot): string {
   );
 
   return `${banner}
+    ${renderManualActions(snapshot, actionState)}
     <div class="cards cards--2">
       ${renderExplanationCard(
         "Latest meaningful outcome",
@@ -1024,7 +1114,113 @@ function renderFreshnessClientScript(snapshot: PhoenixWebSnapshot): string {
   </script>`;
 }
 
-function renderLayout(view: PhoenixConsoleView, snapshot: PhoenixWebSnapshot, body: string): string {
+function renderManualActionClientScript(actionState: PhoenixWebActionState | undefined): string {
+  const payload = JSON.stringify(actionState ?? {});
+  return `<script>
+    (() => {
+      const root = document.querySelector('[data-manual-actions-root]');
+      if (!(root instanceof HTMLElement)) {
+        return;
+      }
+      const buttons = Array.from(root.querySelectorAll('[data-manual-action]'));
+      const feedback = root.querySelector('[data-manual-action-feedback]');
+      if (!(feedback instanceof HTMLElement)) {
+        return;
+      }
+      let state = ${payload};
+      let pollTimer = 0;
+      let waitingForCompletion = Boolean(state?.running);
+
+      const updateButtons = () => {
+        const disabled = Boolean(state?.running);
+        for (const button of buttons) {
+          if (button instanceof HTMLButtonElement) {
+            button.disabled = disabled;
+          }
+        }
+      };
+
+      const renderRunning = () => {
+        if (!state?.running) {
+          return;
+        }
+        const label = state.running.action === 'backup-now' ? 'Backup now' : 'Health check now';
+        feedback.innerHTML = '<section class="card card--warning"><div class="card__eyebrow">Action in progress</div><h3>Browser action status</h3><p>Phoenix is currently running <strong>' + label + '</strong>.</p><p class="muted">Started ' + new Date(state.running.startedAt).toLocaleString('en-US', { dateStyle: 'medium', timeStyle: 'short' }) + '. The page will refresh when the action finishes.</p></section>';
+      };
+
+      const setTemporaryError = (message) => {
+        feedback.innerHTML = '<section class="card card--error"><div class="card__eyebrow">Action failed to start</div><h3>Browser action status</h3><p>' + message + '</p></section>';
+      };
+
+      const sync = async () => {
+        try {
+          const response = await fetch('/api/actions/state', { headers: { accept: 'application/json' }, cache: 'no-store' });
+          if (!response.ok) {
+            throw new Error('HTTP ' + response.status);
+          }
+          state = await response.json();
+          updateButtons();
+          if (state?.running) {
+            renderRunning();
+            return;
+          }
+          if (waitingForCompletion) {
+            window.location.reload();
+          }
+        } catch (error) {
+          setTemporaryError(error instanceof Error ? error.message : String(error));
+        }
+      };
+
+      const ensurePolling = () => {
+        if (pollTimer) {
+          return;
+        }
+        pollTimer = window.setInterval(sync, 1000);
+      };
+
+      updateButtons();
+      if (state?.running) {
+        renderRunning();
+        ensurePolling();
+      }
+
+      for (const button of buttons) {
+        if (!(button instanceof HTMLButtonElement)) {
+          continue;
+        }
+        button.addEventListener('click', async () => {
+          const action = button.dataset.manualAction;
+          if (!action) {
+            return;
+          }
+          try {
+            const response = await fetch('/api/actions/' + action, {
+              method: 'POST',
+              headers: { accept: 'application/json' },
+            });
+            const payload = await response.json().catch(() => ({}));
+            if (!response.ok) {
+              state = payload?.state ?? state;
+              updateButtons();
+              setTemporaryError(String(payload?.error ?? ('HTTP ' + response.status)));
+              return;
+            }
+            state = payload.state;
+            waitingForCompletion = true;
+            updateButtons();
+            renderRunning();
+            ensurePolling();
+          } catch (error) {
+            setTemporaryError(error instanceof Error ? error.message : String(error));
+          }
+        });
+      }
+    })();
+  </script>`;
+}
+
+function renderLayout(view: PhoenixConsoleView, snapshot: PhoenixWebSnapshot, body: string, actionState?: PhoenixWebActionState): string {
   const protection = deriveProtectionState(snapshot);
   const freshness = buildFreshnessExplanation(snapshot);
   const nav = (Object.keys(VIEW_TITLES) as PhoenixConsoleView[])
@@ -1051,6 +1247,8 @@ function renderLayout(view: PhoenixConsoleView, snapshot: PhoenixWebSnapshot, bo
       .nav__link { padding: 10px 14px; border-radius: 999px; background: #1e293b; color: #cbd5e1; }
       .nav__link--active { background: #2563eb; color: white; }
       .refresh-button { appearance: none; border: 1px solid #475569; border-radius: 999px; background: #1e293b; color: #e2e8f0; cursor: pointer; padding: 8px 12px; }
+      .action-button { appearance: none; border: 1px solid rgba(125, 211, 252, 0.45); border-radius: 10px; background: rgba(14, 116, 144, 0.25); color: #e2e8f0; cursor: pointer; font: inherit; margin-top: 12px; padding: 10px 14px; }
+      .action-button:disabled { cursor: wait; opacity: 0.65; }
       .refresh-button:hover { border-color: #93c5fd; }
       .banner { padding: 20px; margin-bottom: 20px; }
       .banner--ok { border-color: #15803d; }
@@ -1089,7 +1287,7 @@ function renderLayout(view: PhoenixConsoleView, snapshot: PhoenixWebSnapshot, bo
       <header class="topbar">
         <div>
           <h1>OpenClaw Phoenix Console</h1>
-          <p class="muted">Read-only local operator view built from the Phoenix Web v1 snapshot contract.</p>
+          <p class="muted">Local operator console built from the Phoenix Web v1 snapshot contract, with only low-risk browser actions enabled.</p>
         </div>
         <div class="topbar__status">
           <div class="inline-badges"><span class="badge badge--${freshness.tone}" data-freshness-badge>${escapeHtml(freshness.eyebrow)}</span></div>
@@ -1106,22 +1304,23 @@ function renderLayout(view: PhoenixConsoleView, snapshot: PhoenixWebSnapshot, bo
       ${body}
     </main>
     ${renderFreshnessClientScript(snapshot)}
+    ${view === "overview" ? renderManualActionClientScript(actionState) : ""}
   </body>
 </html>`;
 }
 
-export function renderPhoenixWebConsolePage(snapshot: PhoenixWebSnapshot, view: PhoenixConsoleView): string {
+export function renderPhoenixWebConsolePage(snapshot: PhoenixWebSnapshot, view: PhoenixConsoleView, actionState?: PhoenixWebActionState): string {
   switch (view) {
     case "overview":
-      return renderLayout(view, snapshot, renderOverview(snapshot));
+      return renderLayout(view, snapshot, renderOverview(snapshot, actionState), actionState);
     case "setup":
-      return renderLayout(view, snapshot, renderSetup(snapshot));
+      return renderLayout(view, snapshot, renderSetup(snapshot), actionState);
     case "activity":
-      return renderLayout(view, snapshot, renderActivity(snapshot.timeline));
+      return renderLayout(view, snapshot, renderActivity(snapshot.timeline), actionState);
     case "archives":
-      return renderLayout(view, snapshot, renderArchives(snapshot));
+      return renderLayout(view, snapshot, renderArchives(snapshot), actionState);
     case "configuration":
-      return renderLayout(view, snapshot, renderConfiguration(snapshot));
+      return renderLayout(view, snapshot, renderConfiguration(snapshot), actionState);
   }
 }
 
@@ -1137,12 +1336,22 @@ export function renderPhoenixWebConsoleErrorPage(options: {
 <body style="font-family: system-ui, sans-serif; background: #0f172a; color: #e2e8f0; margin: 0;">
   <main style="max-width: 820px; margin: 0 auto; padding: 24px;">
     <h1>${escapeHtml(title)}</h1>
-    <p>This read-only Phoenix console could not load the requested view.</p>
+    <p>This local Phoenix console could not load the requested view.</p>
     <p><strong>Route:</strong> <code>${escapeHtml(options.pathname)}</code></p>
     <pre style="white-space: pre-wrap; background: rgba(15,23,42,0.9); border: 1px solid #dc2626; border-radius: 12px; padding: 16px;">${detail}</pre>
     <p>Verify the configured <code>--config</code> and <code>--output</code> paths, then refresh the page.</p>
   </main>
 </body></html>`;
+}
+
+function normalizeManualAction(pathname: string): PhoenixWebManualAction | undefined {
+  if (pathname === "/api/actions/backup-now") {
+    return "backup-now";
+  }
+  if (pathname === "/api/actions/health-check-now") {
+    return "health-check-now";
+  }
+  return undefined;
 }
 
 function writeResponse(response: http.ServerResponse, status: number, contentType: string, body: string, method = "GET") {
@@ -1161,11 +1370,37 @@ export async function startPhoenixWebConsole(options: StartPhoenixWebConsoleOpti
   });
   const server = http.createServer(async (request, response) => {
     const method = request.method ?? "GET";
+    const url = new URL(request.url ?? "/", `http://${request.headers.host ?? "127.0.0.1"}`);
+    if (url.pathname === "/api/actions/state") {
+      if (!options.actionController) {
+        writeResponse(response, 404, "application/json", `${JSON.stringify({ ok: false, error: "Manual browser actions are unavailable." }, null, 2)}\n`, method);
+        return;
+      }
+      if (method !== "GET" && method !== "HEAD") {
+        writeResponse(response, 405, "text/plain", "Method Not Allowed", method);
+        return;
+      }
+      writeResponse(response, 200, "application/json", `${JSON.stringify(options.actionController.getState(), null, 2)}\n`, method);
+      return;
+    }
+    const manualAction = normalizeManualAction(url.pathname);
+    if (manualAction) {
+      if (!options.actionController) {
+        writeResponse(response, 404, "application/json", `${JSON.stringify({ ok: false, error: "Manual browser actions are unavailable." }, null, 2)}\n`, method);
+        return;
+      }
+      if (method !== "POST") {
+        writeResponse(response, 405, "text/plain", "Method Not Allowed", method);
+        return;
+      }
+      const result = await options.actionController.start(manualAction);
+      writeResponse(response, result.ok ? 202 : 409, "application/json", `${JSON.stringify(result, null, 2)}\n`, method);
+      return;
+    }
     if (method !== "GET" && method !== "HEAD") {
       writeResponse(response, 405, "text/plain", "Method Not Allowed", method);
       return;
     }
-    const url = new URL(request.url ?? "/", `http://${request.headers.host ?? "127.0.0.1"}`);
     if (url.pathname === "/api/snapshot") {
       try {
         const snapshot = await options.loadSnapshot();
@@ -1182,7 +1417,7 @@ export async function startPhoenixWebConsole(options: StartPhoenixWebConsoleOpti
     }
     try {
       const snapshot = await options.loadSnapshot();
-      writeResponse(response, 200, "text/html", renderPhoenixWebConsolePage(snapshot, view), method);
+      writeResponse(response, 200, "text/html", renderPhoenixWebConsolePage(snapshot, view, options.actionController?.getState()), method);
     } catch (error) {
       writeResponse(response, 500, "text/html", renderPhoenixWebConsoleErrorPage({ error, pathname: url.pathname, view }), method);
     }

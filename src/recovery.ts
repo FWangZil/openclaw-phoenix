@@ -1,6 +1,7 @@
 import fs from "node:fs/promises";
 import path from "node:path";
-import { type OpenClawStatusResult, runOpenClawBackupCreate, runOpenClawStatus } from "./backup.js";
+import { runOpenClawBackupCreate, runOpenClawStatus } from "./backup.js";
+import { evaluateOpenClawStatusHealth } from "./health.js";
 import {
   dispatchPhoenixNotifications,
   selectPhoenixNotificationEvents,
@@ -56,20 +57,6 @@ export type PhoenixRecoveryResult = {
   operation: PhoenixActionResult;
 };
 
-function evaluateStatusHealth(status: OpenClawStatusResult): PhoenixRecoveryResult["health"] {
-  const gateway = status.gateway;
-  if (gateway?.misconfigured === true) {
-    return { healthy: false, reason: "gateway is misconfigured in openclaw status --json" };
-  }
-  if (gateway?.reachable === false) {
-    return { healthy: false, reason: "gateway is unreachable in openclaw status --json" };
-  }
-  if (gateway && gateway.reachable === true) {
-    return { healthy: true, reason: "gateway reachable" };
-  }
-  return { healthy: false, reason: "openclaw status --json did not report gateway.reachable=true" };
-}
-
 function buildRollbackNotification(options: {
   archivePath?: string;
   healthReason: string;
@@ -121,7 +108,7 @@ export async function runPhoenixRecovery(options: PhoenixRecoveryRequest): Promi
 
   let health = { healthy: false, reason: "health check did not run" };
   try {
-    health = evaluateStatusHealth(await runOpenClawStatus({ openclawBin: options.openclawBin, env: effectiveEnv }));
+    health = evaluateOpenClawStatusHealth(await runOpenClawStatus({ openclawBin: options.openclawBin, env: effectiveEnv }));
   } catch (error) {
     health = { healthy: false, reason: `status check failed: ${String(error)}` };
   }
