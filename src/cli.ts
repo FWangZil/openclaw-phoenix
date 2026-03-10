@@ -4,6 +4,10 @@ import { Command, InvalidArgumentError } from "commander";
 import { installPhoenixHook, removePhoenixHook, DEFAULT_HOOK_EVENT } from "./hook-install.js";
 import { runPhoenixHook } from "./hook-run.js";
 import {
+  formatPhoenixDoctorReport,
+  runPhoenixDoctor,
+} from "./doctor.js";
+import {
   parsePhoenixNotificationMode,
   resolvePhoenixNotificationConfig,
   type PhoenixNotificationMode,
@@ -20,6 +24,7 @@ function parsePositiveInteger(value: string, label: string): number {
   }
   return parsed;
 }
+
 
 type NotificationOptionShape = {
   notify?: PhoenixNotificationMode;
@@ -58,6 +63,31 @@ function resolveNotificationFromOptions(options: NotificationOptionShape) {
 async function main() {
   const program = new Command();
   program.name("openclaw-phoenix").description("Standalone OpenClaw backup watch + retention CLI");
+  const doctorCommand = program
+    .command("doctor")
+    .description("Check local/runtime prerequisites before relying on Phoenix self-heal")
+    .option("--config <path>", "Override OPENCLAW_CONFIG_PATH when resolving the deployment to inspect")
+    .option("--openclaw-bin <path>", "Path to the deployed openclaw binary", DEFAULT_OPENCLAW_BIN)
+    .option("--output <dir>", "Directory Phoenix should use for backup archives and state", DEFAULT_OUTPUT_DIR)
+    .option("--json", "Print the doctor report as JSON", false);
+  addNotificationOptions(doctorCommand, {
+    modeHelp: "Notification mode to validate for the self-heal send path (off|exceptional-only|all)",
+  }).action(async (options) => {
+    const report = await runPhoenixDoctor({
+      configPath: options.config ? resolveUserPath(options.config) : undefined,
+      openclawBin: options.openclawBin,
+      outputDir: resolveOutputDir(options.output),
+      notification: resolveNotificationFromOptions(options),
+    });
+    if (options.json) {
+      console.log(JSON.stringify(report, null, 2));
+    } else {
+      console.log(formatPhoenixDoctorReport(report));
+    }
+    if (!report.ok) {
+      process.exitCode = 1;
+    }
+  });
   program
     .command("restore <archive>")
     .description("Restore a verified OpenClaw backup archive into the current deployment paths")

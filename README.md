@@ -12,16 +12,25 @@ Historical implementation context for future maintainers/operators lives in:
 - `docs/archive/project-journey.md`
 - `docs/archive/operator-handoff.md`
 
+## Repository baseline
+
+- Repo installs and CI use Bun (`bun.lock`, `packageManager: bun@1.3.10`).
+- Runtime target is Node `>=22.12.0`.
+- CI validates install, test, typecheck, build, and CLI help smoke.
+- Versioning and release expectations for this standalone repo live in `docs/releasing.md`.
+
 ## Install and run
 
 From a standalone checkout:
 
 ```sh
 cd openclaw-phoenix
-npm install
+bun install
 ```
 
-`npm install` runs the package `prepare` script, builds `dist/`, and makes the packaged `openclaw-phoenix` bin executable via `dist/cli.js`.
+`bun install` is the repo-default install path. It runs the package `prepare` script, builds `dist/`, and makes the packaged `openclaw-phoenix` bin executable via `dist/cli.js`.
+
+If you specifically want a package-style local install, `npm install` still works, but repo maintenance and CI should stay on Bun so the committed lockfile remains authoritative.
 
 Common ways to run it after install:
 
@@ -33,6 +42,9 @@ node dist/cli.js --help
 
 ## Commands
 
+- `openclaw-phoenix doctor`
+  - Runs a focused local/runtime preflight before you rely on Phoenix self-heal.
+  - Checks `openclaw` binary access, config/state/output paths, obvious permission issues, `openclaw status --json` gateway readiness/auth warnings, and notification-target completeness for the supported send path.
 - `openclaw-phoenix watch`
   - Long-running watcher for config/auth changes.
   - Default behavior is backup-only; add `--self-heal` to run the shared backup/status/rollback flow.
@@ -56,6 +68,32 @@ Phoenix intentionally assumes it is working against an existing OpenClaw deploym
 - Override: `--openclaw-bin <path>`
 
 If `openclaw` is not on `PATH`, point Phoenix at the deployed binary explicitly.
+
+## Doctor preflight
+
+Run this before you depend on self-heal in a deployed environment:
+
+```sh
+openclaw-phoenix doctor \
+  --config ~/.openclaw/openclaw.json \
+  --output ~/openclaw-backups \
+  --notify exceptional-only \
+  --notify-target room://operators
+```
+
+Doctor behavior:
+
+- exits non-zero when Phoenix finds a hard blocker
+- keeps checks read-only: it does not send notifications and does not mutate deployment state
+- uses `openclaw status --json` for the gateway/self-heal probe, so fix whatever that command reports before you trust self-heal
+- supports `--json` if you want to consume the report from automation
+
+Recommended doctor practice:
+
+- Run `doctor` with the same `--config`, `--openclaw-bin`, `--output`, and `--notify*` flags you intend to use in production.
+- Treat backup-only readiness as the minimum bar for `watch` without `--self-heal`.
+- Treat self-heal readiness as the gate for `hook install`, `hook run`, or `watch --self-heal`.
+- Re-run doctor after moving the deployment, changing the `openclaw` binary path, or changing notification targets.
 
 ### Root config path
 
@@ -87,7 +125,7 @@ Phoenix resolves the deployment state dir in this order:
 - Default: `~/openclaw-backups`
 - Override: `--output <dir>`
 
-Phoenix stores watch-mode archives, hook-mode archives, and its hook state file in this output directory.
+Phoenix stores watch-mode archives, hook-mode archives, and its recovery state file in this output directory.
 
 ## Watch flow
 
@@ -124,6 +162,25 @@ Operational notes:
 - If the root config file changes, Phoenix refreshes the derived watch target set before the next backup cycle.
 - Invalid/missing config-derived paths are reported as warnings; the watcher stays up and continues watching the base paths it can resolve.
 - A failed backup cycle logs an error but does not terminate the watch session.
+
+### Backup-only vs self-heal watch
+
+Use `watch` modes intentionally:
+
+- `watch` (default, backup-only)
+  - creates archives after watched config/auth changes settle
+  - prunes retained archives
+  - does **not** run `openclaw status --json`
+  - does **not** promote `latestKnownGoodArchivePath`
+  - does **not** send notifications, even if `--notify*` flags are present
+- `watch --self-heal`
+  - still creates a fresh backup first
+  - then runs the same status/health/rollback/retention/notification flow as `hook run`
+  - can promote a backup to `latestKnownGoodArchivePath` after a healthy cycle
+  - can attempt rollback after an unhealthy cycle
+  - is the only watch mode where `--notify exceptional-only|all` and `--notify-target ...` matter
+
+For most operators, `watch` without `--self-heal` is the safer continuous mode. Add `hook install` for startup rollback protection, and only enable `watch --self-heal` when you explicitly want every settled config/auth change burst to run the full recovery flow.
 
 ## Restore flow
 
@@ -281,11 +338,6 @@ Flow:
 - `retention`
 - `notification`
 
-Exit behavior:
-
-- Healthy path: success requires a healthy status and no backup error.
-- Unhealthy path: success requires a successful rollback restore.
-
 ## Notification behavior
 
 Phoenix only emits notification summaries from the shared recovery flow used by `hook run` and `watch --self-heal`.
@@ -342,6 +394,121 @@ Retention rules:
 - The current `latestKnownGoodArchivePath` is always added to the keep set.
 - Therefore, a known-good archive is protected from pruning even when it is older than the normal retention window.
 
+## Recommended deployment patterns
+
+### 1. Continuous backups only
+
+Use this when you want archives for operator-managed config/auth changes but do **not** want Phoenix to attempt restore automatically:
+
+```sh
+openclaw-phoenix watch \
+  --config ~/.openclaw/openclaw.json \
+  --openclaw-bin /usr/local/bin/openclaw \
+  --output ~/openclaw-backups
+```
+
+This mode is backup-only, ignores notification flags, and never updates the known-good pointer.
+
+### 2. Startup rollback protection
+
+Use this when you want the deployed OpenClaw startup hook to run backup → health check → rollback if startup is unhealthy:
+
+```sh
+openclaw-phoenix hook install \
+  --config ~/.openclaw/openclaw.json \
+  --openclaw-bin /usr/local/bin/openclaw \
+  --phoenix-bin /usr/local/bin/openclaw-phoenix \
+  --output ~/openclaw-backups
+```
+
+Recommended follow-up after install:
+
+```sh
+openclaw-phoenix hook run \
+  --config ~/.openclaw/openclaw.json \
+  --openclaw-bin /usr/local/bin/openclaw \
+  --output ~/openclaw-backups \
+  --json
+```
+
+That manual run is the fastest way to confirm the hook path works and to seed `latestKnownGoodArchivePath` during a known-healthy window.
+
+### 3. Common operator baseline: backup-only watch + startup hook
+
+For most operators, the practical baseline is:
+
+1. run backup-only `watch` continuously beside the deployment,
+2. install the startup hook with `hook install`, and
+3. manually exercise `hook run --json` once while the deployment is healthy.
+
+That gives you frequent archives for config/auth changes plus startup rollback protection, without making every watch-triggered backup cycle capable of restoring live state.
+
+### 4. Continuous self-heal watch
+
+Only choose `watch --self-heal` when you want Phoenix to evaluate health and possibly roll back after each settled config/auth change burst, not only on startup. Keep the notification flags on this command aligned with the `hook install` or `hook run` flags you expect operators to rely on.
+
+## Troubleshooting
+
+### Watch is running but backups are not firing
+
+Check these first:
+
+- `watch` is change-driven. It does **not** create a backup immediately on startup.
+- Phoenix only watches the resolved root config file, the OAuth/credentials dir, discovered `$include` files, and agent auth-store files. Changes outside that footprint do not trigger a cycle.
+- Review startup logs for `watching N path(s)` and later `change detected: ...` lines.
+- If Phoenix prints `watch target refresh skipped config-derived paths: ...`, fix that config/include/auth-store problem first. The watcher stays up, but only the base paths it could resolve are covered.
+- If you changed the root config path or `OPENCLAW_CONFIG_PATH`, restart `watch` with the intended `--config` value and re-run `doctor`.
+
+### Phoenix cannot find `openclaw`
+
+- Run `openclaw-phoenix doctor --openclaw-bin /path/to/openclaw ...`.
+- If doctor reports `could not find openclaw on PATH`, either install `openclaw` on `PATH` or pass `--openclaw-bin` explicitly.
+- If doctor reports an execute-permission problem, fix the deployed binary permissions for the service user.
+- Prefer an explicit `--openclaw-bin` in long-lived operator scripts and hook installs so Phoenix is not dependent on an interactive shell `PATH`.
+
+### Config is missing or invalid
+
+- `doctor` reports a blocker when the resolved root config file is missing, unreadable, or not a file.
+- `watch` keeps running if config-derived watch targets cannot be resolved, but it logs warnings and falls back to the base paths it can still monitor.
+- `hook install` and `hook remove` both resolve the same deployment paths; if you point Phoenix at the wrong config, you will mutate the wrong deployment.
+- If you override the hook event, it must contain a colon, such as `gateway:startup`.
+
+### Notifications are not being delivered
+
+- Notifications are off by default. Passing only `--notify-target` or routing hints does not enable them.
+- Remote delivery requires both a sending mode (`--notify exceptional-only` or `--notify all`) and `--notify-target <target>`.
+- `--notify-channel`, `--notify-account`, and `--notify-thread-id` are only routing hints for `openclaw gateway call send`; they do not replace the required target.
+- Backup-only `watch` never sends notifications. Use `hook run`, the installed hook, or `watch --self-heal` if you expect delivery.
+- A delivery failure does **not** undo a healthy promotion or a successful rollback. Phoenix records the recovery result and reports notification delivery failure separately.
+
+### Unhealthy result with no known-good archive
+
+This means Phoenix detected an unhealthy status, but `latestKnownGoodArchivePath` has not been promoted yet.
+
+Common causes:
+
+- Phoenix has only run in backup-only watch mode.
+- The first self-heal or hook run happened during an unhealthy startup.
+- A prior healthy run created a backup, but the backup path was never promoted because health was not healthy.
+
+How to fix it:
+
+1. bring the deployment to a healthy state,
+2. run `openclaw-phoenix hook run --json ...` or let `watch --self-heal` complete a healthy cycle,
+3. confirm `latestKnownGoodArchivePath` is present in `<outputDir>/.openclaw-phoenix-state.json` or in `hook run --json` output.
+
+### Rollback failed
+
+When Phoenix reports a rollback failure:
+
+1. identify the archive Phoenix tried to restore from the `hook run --json` output or `<outputDir>/.openclaw-phoenix-state.json`,
+2. verify it manually with `openclaw backup verify <archive> --json`,
+3. preview the restore plan with `openclaw-phoenix restore <archive> --config ... --openclaw-bin ... --dry-run`,
+4. fix the underlying restore problem (for example current destination permissions or path issues),
+5. rerun `hook run --json` only after the restore path is healthy enough to trust.
+
+Remember that Phoenix restore safety checks reject malformed archives, duplicate destination writes, and symlinked destination paths.
+
 ## Suggested operator workflows
 
 Continuous backup watcher beside a running deployment:
@@ -370,3 +537,23 @@ Remove Phoenix-managed hook injection cleanly:
 ```sh
 openclaw-phoenix hook remove --config ~/.openclaw/openclaw.json
 ```
+
+## Operator smoke checks and release baseline
+
+Smallest useful smoke checks for documented CLI surfaces:
+
+```sh
+node dist/cli.js doctor --help
+node dist/cli.js watch --help
+node dist/cli.js hook --help
+```
+
+For a fresh checkout or release candidate, the repo baseline remains:
+
+1. `bun install`
+2. `bun run test`
+3. `bun run typecheck`
+4. `bun run build`
+5. `bun run smoke:cli`
+
+See `docs/releasing.md` for the standalone repo release expectations.

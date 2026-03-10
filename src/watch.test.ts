@@ -290,6 +290,94 @@ describe("startBackupWatch", () => {
     expect(payload.message).toContain("confirmed healthy status");
   }, 15_000);
 
+  it("keeps watching after a notification delivery failure and succeeds on the next change", async () => {
+    const homeDir = await makeTempDir("phoenix-watch-notify-retry-");
+    const stateDir = path.join(homeDir, ".openclaw");
+    const outputDir = path.join(homeDir, "archives");
+    const configPath = path.join(stateDir, "openclaw.json");
+    await fs.mkdir(stateDir, { recursive: true });
+    await rewriteConfig(configPath, 0);
+    const sourceStateDir = path.join("/tmp", "phoenix-watch-notify-retry-source");
+    const firstArchive = await buildArchiveFixture({
+      archiveRoot: "2026-03-10T03-00-00.000Z-openclaw-backup",
+      manifest: {
+        schemaVersion: 1,
+        archiveRoot: "2026-03-10T03-00-00.000Z-openclaw-backup",
+        createdAt: "2026-03-10T03:00:00.000Z",
+        paths: { stateDir: sourceStateDir },
+        assets: [],
+      },
+      files: [],
+    });
+    const secondArchive = await buildArchiveFixture({
+      archiveRoot: "2026-03-10T04-00-00.000Z-openclaw-backup",
+      manifest: {
+        schemaVersion: 1,
+        archiveRoot: "2026-03-10T04-00-00.000Z-openclaw-backup",
+        createdAt: "2026-03-10T04:00:00.000Z",
+        paths: { stateDir: sourceStateDir },
+        assets: [],
+      },
+      files: [],
+    });
+    const archiveQueuePath = path.join(homeDir, "archive-queue.json");
+    const statusModePath = path.join(homeDir, "status-mode.txt");
+    const restoreMarkerPath = path.join(homeDir, "restore-marker.txt");
+    const commandLogPath = path.join(homeDir, "command-log.txt");
+    const notificationLogPath = path.join(homeDir, "notification-log.jsonl");
+    const notificationModePath = path.join(homeDir, "notification-mode.txt");
+    await fs.writeFile(archiveQueuePath, JSON.stringify([firstArchive, secondArchive]), "utf8");
+    await fs.writeFile(statusModePath, "healthy", "utf8");
+    await fs.writeFile(notificationModePath, "fail", "utf8");
+    const openclawBin = await createFakeOpenClaw({
+      homeDir,
+      archiveQueuePath,
+      statusModePath,
+      restoreMarkerPath,
+      commandLogPath,
+      verifyArchiveRoot: "2026-03-10T03-00-00.000Z-openclaw-backup",
+      notificationLogPath,
+      notificationModePath,
+    });
+    const logs: string[] = [];
+    const errors: string[] = [];
+    const session = await startBackupWatch({
+      configPath,
+      debounceMs: 40,
+      env: { ...process.env, HOME: homeDir, OPENCLAW_STATE_DIR: stateDir, VITEST: "true" },
+      openclawBin,
+      outputDir,
+      retain: 2,
+      selfHeal: true,
+      notification: {
+        enabled: true,
+        policy: "all",
+        target: {
+          to: "room://operators",
+        },
+      },
+      log: (message) => logs.push(message),
+      error: (message) => errors.push(message),
+    });
+    sessions.push(session);
+
+    await new Promise((resolve) => setTimeout(resolve, 150));
+    await rewriteConfig(configPath, 1);
+    await waitFor(async () => errors.some((entry) => entry.includes("notification delivery failed (healthy)")));
+
+    await fs.writeFile(notificationModePath, "success", "utf8");
+    await rewriteConfig(configPath, 2);
+    await waitFor(async () => await fileExists(notificationLogPath));
+
+    const commandLog = await readCommandLog(commandLogPath);
+    expect(commandLog.filter((entry) => entry === "backup create")).toHaveLength(2);
+    expect(commandLog.filter((entry) => entry === "status")).toHaveLength(2);
+    expect(commandLog.filter((entry) => entry === "gateway call send")).toHaveLength(2);
+    expect(errors.some((entry) => entry.includes("notification delivery failed (healthy)"))).toBe(true);
+    expect(logs.some((entry) => entry.includes("latest-known-good updated"))).toBe(true);
+    expect(JSON.parse((await fs.readFile(notificationLogPath, "utf8")).trim())).toMatchObject({ to: "room://operators" });
+  }, 15_000);
+
   it("routes opt-in watch self-heal cycles through shared recovery and rolls back unhealthy snapshots", async () => {
     const homeDir = await makeTempDir("phoenix-watch-heal-");
     const stateDir = path.join(homeDir, ".openclaw");

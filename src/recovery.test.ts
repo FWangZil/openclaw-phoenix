@@ -449,4 +449,137 @@ describe("runPhoenixRecovery", () => {
     expect(result.notifications[0]?.message).toContain("rolled back");
     expect(JSON.parse(await fs.readFile(liveConfigPath, "utf8"))).toEqual({ version: "healthy" });
   });
+
+  it("reports an unhealthy run with no known-good archive to restore", async () => {
+    const homeDir = await makeTempDir("phoenix-recovery-missing-known-good-");
+    const outputDir = path.join(homeDir, "archives");
+    const archiveRoot = "2026-03-10T02-00-00.000Z-openclaw-backup";
+    const sourceStateDir = path.join("/tmp", "phoenix-recovery-missing-known-good-state");
+    const unhealthyArchive = await buildArchiveFixture({
+      archiveRoot,
+      manifest: {
+        schemaVersion: 1,
+        archiveRoot,
+        createdAt: "2026-03-10T02:00:00.000Z",
+        paths: { stateDir: sourceStateDir },
+        assets: [],
+      },
+      files: [],
+    });
+    const archiveQueuePath = path.join(homeDir, "archive-queue.json");
+    const statusModePath = path.join(homeDir, "status-mode.txt");
+    const restoreMarkerPath = path.join(homeDir, "restore-marker.txt");
+    await fs.writeFile(archiveQueuePath, JSON.stringify([unhealthyArchive]), "utf8");
+    await fs.writeFile(statusModePath, "unhealthy", "utf8");
+    const openclawBin = await createFakeOpenClaw({
+      homeDir,
+      archiveQueuePath,
+      statusModePath,
+      restoreMarkerPath,
+      verifyArchiveRoot: archiveRoot,
+    });
+
+    const result = await runPhoenixRecovery({
+      openclawBin,
+      outputDir,
+      retain: 1,
+      env: { ...process.env, HOME: homeDir },
+    });
+
+    expect(result.ok).toBe(false);
+    expect(result.rollback).toMatchObject({ needed: true, attempted: false, restored: false });
+    expect(result.notifications).toEqual([
+      expect.objectContaining({ code: "rollback-missing-known-good", severity: "warning" }),
+    ]);
+    expect(result.knownGood.currentArchivePath).toBeUndefined();
+    expect(result.state.latestKnownGoodArchivePath).toBeUndefined();
+    expect(result.state.lastBackupArchivePath).toBe(result.backup.archivePath);
+    await expect(fs.stat(restoreMarkerPath)).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it("reports rollback failure when the known-good archive can no longer be restored", async () => {
+    const homeDir = await makeTempDir("phoenix-recovery-rollback-failed-");
+    const outputDir = path.join(homeDir, "archives");
+    const currentStateDir = path.join(homeDir, ".openclaw");
+    const liveConfigPath = path.join(currentStateDir, "runtime-config.json");
+    await fs.mkdir(currentStateDir, { recursive: true });
+    await fs.writeFile(liveConfigPath, JSON.stringify({ version: "healthy" }), "utf8");
+    const sourceStateDir = path.join("/tmp", "phoenix-recovery-rollback-failed-state");
+    const healthyArchiveRoot = "2026-03-10T03-00-00.000Z-openclaw-backup";
+    const healthyArchive = await buildArchiveFixture({
+      archiveRoot: healthyArchiveRoot,
+      manifest: {
+        schemaVersion: 1,
+        archiveRoot: healthyArchiveRoot,
+        createdAt: "2026-03-10T03:00:00.000Z",
+        paths: {
+          stateDir: sourceStateDir,
+          configPath: path.join(sourceStateDir, "openclaw.json"),
+          oauthDir: path.join(sourceStateDir, "credentials"),
+        },
+        assets: [
+          {
+            kind: "config",
+            sourcePath: path.join(sourceStateDir, "runtime-config.json"),
+            archivePath: buildBackupArchivePath(healthyArchiveRoot, path.join(sourceStateDir, "runtime-config.json")),
+          },
+        ],
+      },
+      files: [
+        {
+          archivePath: buildBackupArchivePath(healthyArchiveRoot, path.join(sourceStateDir, "runtime-config.json")),
+          contents: JSON.stringify({ version: "healthy" }),
+        },
+      ],
+    });
+    const unhealthyArchiveRoot = "2026-03-10T04-00-00.000Z-openclaw-backup";
+    const unhealthyArchive = await buildArchiveFixture({
+      archiveRoot: unhealthyArchiveRoot,
+      manifest: {
+        schemaVersion: 1,
+        archiveRoot: unhealthyArchiveRoot,
+        createdAt: "2026-03-10T04:00:00.000Z",
+        paths: { stateDir: sourceStateDir },
+        assets: [],
+      },
+      files: [],
+    });
+    const archiveQueuePath = path.join(homeDir, "archive-queue.json");
+    const statusModePath = path.join(homeDir, "status-mode.txt");
+    const restoreMarkerPath = path.join(homeDir, "restore-marker.txt");
+    await fs.writeFile(archiveQueuePath, JSON.stringify([healthyArchive, unhealthyArchive]), "utf8");
+    await fs.writeFile(statusModePath, "healthy", "utf8");
+    const openclawBin = await createFakeOpenClaw({
+      homeDir,
+      archiveQueuePath,
+      statusModePath,
+      restoreMarkerPath,
+      verifyArchiveRoot: healthyArchiveRoot,
+    });
+
+    const first = await runPhoenixRecovery({
+      openclawBin,
+      outputDir,
+      retain: 2,
+      env: { ...process.env, HOME: homeDir, OPENCLAW_STATE_DIR: currentStateDir },
+    });
+    await fs.rm(first.knownGood.currentArchivePath as string, { force: true });
+    await fs.writeFile(liveConfigPath, JSON.stringify({ version: "bad" }), "utf8");
+    await fs.writeFile(statusModePath, "unhealthy", "utf8");
+
+    const result = await runPhoenixRecovery({
+      openclawBin,
+      outputDir,
+      retain: 2,
+      env: { ...process.env, HOME: homeDir, OPENCLAW_STATE_DIR: currentStateDir },
+    });
+
+    expect(result.ok).toBe(false);
+    expect(result.rollback).toMatchObject({ attempted: true, restored: false, archivePath: first.knownGood.currentArchivePath });
+    expect(result.rollback.error).toMatch(/ENOENT|no such file/i);
+    expect(result.notifications).toEqual([
+      expect.objectContaining({ code: "rollback-failed", severity: "error" }),
+    ]);
+    expect(JSON.parse(await fs.readFile(liveConfigPath, "utf8"))).toEqual({ version: "bad" });
+  });
 });
