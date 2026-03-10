@@ -5,6 +5,7 @@ import * as tar from "tar";
 import { afterEach, describe, expect, it } from "vitest";
 import { buildBackupArchivePath } from "./paths.js";
 import { runPhoenixRecovery } from "./recovery.js";
+import { buildPhoenixWebSnapshot } from "./web-contract.js";
 
 const tempDirs: string[] = [];
 
@@ -151,6 +152,18 @@ describe("runPhoenixRecovery", () => {
     expect(result.notificationDelivery.results).toEqual([]);
     const persistedState = JSON.parse(await fs.readFile(path.join(outputDir, ".openclaw-phoenix-state.json"), "utf8"));
     expect(persistedState.latestKnownGoodArchivePath).toBe(result.backup.archivePath);
+    const snapshot = await buildPhoenixWebSnapshot({
+      env: { ...process.env, HOME: homeDir },
+      outputDir,
+      timelineLimit: 5,
+    });
+    expect(snapshot.overview.latestAction).toMatchObject({ origin: "manual", operation: "recovery-cycle", status: "ok" });
+    expect(snapshot.overview.latestHealth?.result).toEqual({ attempted: true, healthy: true, reason: "gateway reachable" });
+    expect(snapshot.config.origins.manual).toMatchObject({ outputDir, retain: 1, notification: { policy: "off" } });
+    expect(snapshot.archives.archives[0]).toMatchObject({
+      archivePath: result.backup.archivePath,
+      roles: expect.arrayContaining(["latest-known-good", "last-backup"]),
+    });
   });
 
   it("rolls back to the previous known-good archive and protects it during retention", async () => {

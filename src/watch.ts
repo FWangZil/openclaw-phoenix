@@ -8,6 +8,7 @@ import { normalizePathKey, shortenHomePath } from "./paths.js";
 import { runPhoenixRecovery } from "./recovery.js";
 import { pruneBackupArchives } from "./retention.js";
 import { type WatchPlan, resolveWatchPlan } from "./watch-plan.js";
+import { recordPhoenixBackupWatchAction } from "./web-contract.js";
 
 export const DEFAULT_DEBOUNCE_MS = 1_000;
 export const DEFAULT_RETAIN = 100;
@@ -36,18 +37,47 @@ function formatArchivePath(archivePath: string | undefined, env: NodeJS.ProcessE
 }
 
 async function runBackupOnlyWatchCycle(options: StartBackupWatchOptions, effectiveEnv: NodeJS.ProcessEnv, log: (message: string) => void) {
-  const result = await runOpenClawBackupCreate({
-    openclawBin: options.openclawBin,
-    outputDir: `${options.outputDir}${path.sep}`,
-    env: effectiveEnv,
-  });
-  const retention = await pruneBackupArchives({
-    directory: options.outputDir,
-    retain: options.retain ?? DEFAULT_RETAIN,
-  });
-  log(`backup complete: ${formatArchivePath(result.archivePath, effectiveEnv)}`);
-  if (retention.deleted.length > 0) {
-    log(`retention pruned ${retention.deleted.length} old archive(s)`);
+  const startedAt = new Date().toISOString();
+  try {
+    const result = await runOpenClawBackupCreate({
+      openclawBin: options.openclawBin,
+      outputDir: `${options.outputDir}${path.sep}`,
+      env: effectiveEnv,
+    });
+    const retention = await pruneBackupArchives({
+      directory: options.outputDir,
+      retain: options.retain ?? DEFAULT_RETAIN,
+    });
+    await recordPhoenixBackupWatchAction({
+      configPath: options.configPath,
+      outputDir: options.outputDir,
+      retain: options.retain ?? DEFAULT_RETAIN,
+      startedAt,
+      finishedAt: new Date().toISOString(),
+      backup: {
+        attempted: true,
+        archivePath: result.archivePath,
+      },
+      retention,
+    });
+    log(`backup complete: ${formatArchivePath(result.archivePath, effectiveEnv)}`);
+    if (retention.deleted.length > 0) {
+      log(`retention pruned ${retention.deleted.length} old archive(s)`);
+    }
+  } catch (error) {
+    await recordPhoenixBackupWatchAction({
+      configPath: options.configPath,
+      outputDir: options.outputDir,
+      retain: options.retain ?? DEFAULT_RETAIN,
+      startedAt,
+      finishedAt: new Date().toISOString(),
+      backup: {
+        attempted: true,
+        error: String(error),
+      },
+      retention: { kept: [], deleted: [] },
+    });
+    throw error;
   }
 }
 
@@ -64,6 +94,8 @@ async function runSelfHealWatchCycle(
     retain: options.retain ?? DEFAULT_RETAIN,
     env: effectiveEnv,
     notification: options.notification,
+    origin: "watch",
+    selfHeal: true,
   });
   if (recovery.backup.archivePath) {
     log(`backup complete: ${formatArchivePath(recovery.backup.archivePath, effectiveEnv)}`);

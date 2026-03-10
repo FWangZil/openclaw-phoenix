@@ -8,6 +8,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import { resolvePhoenixCommand } from "./phoenix-command.js";
 import { installPhoenixHook, PHOENIX_HOOK_NAME, removePhoenixHook } from "./hook-install.js";
 import { buildBackupArchivePath } from "./paths.js";
+import { buildPhoenixWebSnapshot } from "./web-contract.js";
 
 const tempDirs: string[] = [];
 
@@ -198,6 +199,21 @@ exec node --import tsx ${JSON.stringify(path.resolve("src/cli.ts"))} "$@"
     expect(installedConfig.hooks.internal.entries.unrelated).toEqual({ enabled: true, note: "keep-me" });
     expect(installedConfig.hooks.internal.entries[PHOENIX_HOOK_NAME].managedBy).toBe("openclaw-phoenix");
     const hookDir = path.join(stateDir, "hooks", PHOENIX_HOOK_NAME);
+    const snapshotAfterInstall = await buildPhoenixWebSnapshot({
+      configPath,
+      env: { ...process.env, HOME: homeDir, OPENCLAW_STATE_DIR: stateDir },
+      outputDir,
+      timelineLimit: 5,
+    });
+    expect(snapshotAfterInstall.config.origins.hook).toMatchObject({
+      installed: true,
+      selfHeal: true,
+      eventKey: "gateway:startup",
+      hookDir,
+      outputDir,
+      retain: 1,
+      notification: { policy: "off" },
+    });
     const hookModule = (await import(pathToFileURL(path.join(hookDir, "handler.js")).href)) as {
       default?: (event: { messages: string[] }) => Promise<void>;
     };

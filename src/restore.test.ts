@@ -5,6 +5,7 @@ import * as tar from "tar";
 import { afterEach, describe, expect, it } from "vitest";
 import { buildBackupArchivePath } from "./paths.js";
 import { restoreBackupArchive } from "./restore.js";
+import { buildPhoenixWebSnapshot } from "./web-contract.js";
 
 const tempDirs: string[] = [];
 
@@ -233,12 +234,20 @@ describe("restoreBackupArchive", () => {
     });
 
     expect(result.restoredPaths).toEqual([currentStateDir]);
+    expect(result.operation).toMatchObject({ origin: "manual", operation: "restore", status: "ok" });
     await expect(fs.readFile(path.join(currentStateDir, "openclaw.json"), "utf8")).resolves.toContain(
       '"restored":true',
     );
     await expect(
       fs.readFile(path.join(currentStateDir, "agents", "main", "agent", "auth-profiles.json"), "utf8"),
     ).resolves.toContain('"profiles"');
+    const snapshot = await buildPhoenixWebSnapshot({
+      env: { ...process.env, HOME: homeDir, OPENCLAW_STATE_DIR: currentStateDir },
+      outputDir: path.dirname(archivePath),
+      timelineLimit: 5,
+    });
+    expect(snapshot.overview.latestRestore?.result).toMatchObject({ archivePath, restoredPaths: [currentStateDir] });
+    expect(snapshot.config.origins.manual).toMatchObject({ outputDir: path.dirname(archivePath), dryRun: false });
   });
 
   it("rejects symlinked restore targets", async () => {

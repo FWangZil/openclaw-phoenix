@@ -5,6 +5,7 @@ import * as tar from "tar";
 import { afterEach, describe, expect, it } from "vitest";
 import type { BackupWatchSession } from "./watch.js";
 import { startBackupWatch } from "./watch.js";
+import { buildPhoenixWebSnapshot } from "./web-contract.js";
 
 const tempDirs: string[] = [];
 const sessions: BackupWatchSession[] = [];
@@ -212,6 +213,24 @@ describe("startBackupWatch", () => {
     expect(await fileExists(path.join(outputDir, ".openclaw-phoenix-state.json"))).toBe(false);
     expect(await fileExists(notificationLogPath)).toBe(false);
     expect(logs).toContain("watch mode: backup-only");
+    await waitFor(async () => {
+      const snapshot = await buildPhoenixWebSnapshot({
+        configPath,
+        env: { ...process.env, HOME: homeDir, OPENCLAW_STATE_DIR: stateDir },
+        outputDir,
+        timelineLimit: 5,
+      });
+      return snapshot.overview.latestAction !== undefined;
+    });
+    const snapshot = await buildPhoenixWebSnapshot({
+      configPath,
+      env: { ...process.env, HOME: homeDir, OPENCLAW_STATE_DIR: stateDir },
+      outputDir,
+      timelineLimit: 5,
+    });
+    expect(snapshot.overview.latestAction).toMatchObject({ origin: "watch", operation: "backup-cycle", status: "ok" });
+    expect(snapshot.overview.latestHealth).toBeUndefined();
+    expect(snapshot.config.origins.watch).toMatchObject({ selfHeal: false, retain: 1, notification: { policy: "off" } });
   }, 15_000);
 
   it("dispatches all-policy healthy notifications when watch self-heal is enabled", async () => {

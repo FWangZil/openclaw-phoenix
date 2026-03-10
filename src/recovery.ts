@@ -8,15 +8,12 @@ import {
   type PhoenixNotificationDispatch,
   type PhoenixRecoveryNotificationEvent,
 } from "./notify.js";
+import { readPhoenixRecoveryState, type PhoenixRecoveryState, writePhoenixRecoveryState } from "./recovery-state.js";
 import { pruneBackupArchives, type RetentionResult } from "./retention.js";
 import { restoreBackupArchive } from "./restore.js";
+import { recordPhoenixRecoveryAction, type PhoenixActionResult, type PhoenixWebOrigin } from "./web-contract.js";
 
-export type PhoenixRecoveryState = {
-  schemaVersion: 1;
-  latestKnownGoodArchivePath?: string;
-  lastBackupArchivePath?: string;
-  updatedAt: string;
-};
+export type { PhoenixRecoveryState } from "./recovery-state.js";
 
 export type PhoenixRecoveryRequest = {
   configPath?: string;
@@ -25,6 +22,8 @@ export type PhoenixRecoveryRequest = {
   retain: number;
   env?: NodeJS.ProcessEnv;
   notification?: PhoenixNotificationConfig;
+  origin?: PhoenixWebOrigin;
+  selfHeal?: boolean;
 };
 
 export type PhoenixRecoveryResult = {
@@ -54,33 +53,8 @@ export type PhoenixRecoveryResult = {
   notifications: PhoenixRecoveryNotificationEvent[];
   notificationDelivery: PhoenixNotificationDispatch;
   state: PhoenixRecoveryState;
+  operation: PhoenixActionResult;
 };
-
-function resolveStateFilePath(outputDir: string): string {
-  return path.join(outputDir, ".openclaw-phoenix-state.json");
-}
-
-async function readPhoenixRecoveryState(outputDir: string): Promise<PhoenixRecoveryState> {
-  const raw = await fs.readFile(resolveStateFilePath(outputDir), "utf8").catch(() => null);
-  if (!raw) {
-    return { schemaVersion: 1, updatedAt: new Date(0).toISOString() };
-  }
-  const parsed = JSON.parse(raw) as Partial<PhoenixRecoveryState>;
-  return {
-    schemaVersion: 1,
-    latestKnownGoodArchivePath: typeof parsed.latestKnownGoodArchivePath === "string"
-      ? parsed.latestKnownGoodArchivePath
-      : undefined,
-    lastBackupArchivePath: typeof parsed.lastBackupArchivePath === "string" ? parsed.lastBackupArchivePath : undefined,
-    updatedAt: typeof parsed.updatedAt === "string" ? parsed.updatedAt : new Date(0).toISOString(),
-  };
-}
-
-async function writePhoenixRecoveryState(outputDir: string, state: PhoenixRecoveryState): Promise<void> {
-  await fs.mkdir(outputDir, { recursive: true });
-  await fs.writeFile(resolveStateFilePath(outputDir), `${JSON.stringify(state, null, 2)}
-`, "utf8");
-}
 
 function evaluateStatusHealth(status: OpenClawStatusResult): PhoenixRecoveryResult["health"] {
   const gateway = status.gateway;
@@ -124,6 +98,7 @@ function buildRollbackNotification(options: {
 }
 
 export async function runPhoenixRecovery(options: PhoenixRecoveryRequest): Promise<PhoenixRecoveryResult> {
+  const startedAt = new Date().toISOString();
   const effectiveEnv = options.configPath
     ? { ...process.env, ...options.env, OPENCLAW_CONFIG_PATH: options.configPath }
     : (options.env ?? process.env);
@@ -176,6 +151,8 @@ export async function runPhoenixRecovery(options: PhoenixRecoveryRequest): Promi
           archivePath: candidate,
           configPath: options.configPath,
           openclawBin: options.openclawBin,
+          origin: options.origin,
+          recordInWebState: false,
           yes: true,
           env: effectiveEnv,
           log: () => undefined,
@@ -220,6 +197,35 @@ export async function runPhoenixRecovery(options: PhoenixRecoveryRequest): Promi
     notification: options.notification,
     openclawBin: options.openclawBin,
   });
+  const finishedAt = new Date().toISOString();
+  const operation = await recordPhoenixRecoveryAction({
+    origin: options.origin ?? "manual",
+    configPath: options.configPath,
+    outputDir: options.outputDir,
+    retain: options.retain,
+    selfHeal: options.selfHeal,
+    notification: options.notification,
+    startedAt,
+    finishedAt,
+    result: {
+      ok,
+      backup: {
+        attempted: true,
+        archivePath: backupArchivePath,
+        error: backupError,
+      },
+      health,
+      knownGood: {
+        previousArchivePath: previousKnownGoodArchivePath,
+        currentArchivePath: state.latestKnownGoodArchivePath,
+        promotedArchivePath,
+      },
+      rollback,
+      retention,
+      notifications,
+      notificationDelivery,
+    },
+  });
 
   return {
     ok,
@@ -239,5 +245,6 @@ export async function runPhoenixRecovery(options: PhoenixRecoveryRequest): Promi
     notifications,
     notificationDelivery,
     state,
+    operation,
   };
 }

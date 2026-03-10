@@ -55,6 +55,10 @@ node dist/cli.js --help
   - Injects a managed internal hook into an existing OpenClaw deployment.
 - `openclaw-phoenix hook run`
   - Internal command used by the installed hook to run backup → health check → rollback/retain.
+- `openclaw-phoenix web snapshot`
+  - Prints the current Web v1 backend contract JSON for overview, timeline, config, and archive summaries.
+- `openclaw-phoenix web serve`
+  - Serves a local read-only Phoenix console with Overview, Setup, Activity, Archives, and Configuration views.
 - `openclaw-phoenix hook remove`
   - Removes only the Phoenix-managed hook entry and files.
 
@@ -125,7 +129,7 @@ Phoenix resolves the deployment state dir in this order:
 - Default: `~/openclaw-backups`
 - Override: `--output <dir>`
 
-Phoenix stores watch-mode archives, hook-mode archives, and its recovery state file in this output directory.
+Phoenix stores watch-mode archives, hook-mode archives, its recovery state file, and the Web v1 structured state file in this output directory.
 
 ## Watch flow
 
@@ -337,6 +341,52 @@ Flow:
 - `rollback`
 - `retention`
 - `notification`
+
+It now also includes a stable nested `operation` object that preserves the run origin plus structured backup/health/rollback/notification outcomes for backend consumers.
+
+## Web/backend snapshot contract
+
+Use `web snapshot` when you want a stable structured read model for a future local backend or web UI without parsing logs:
+
+```sh
+openclaw-phoenix web snapshot --config ~/.openclaw/openclaw.json --output ~/openclaw-backups
+```
+
+The JSON snapshot includes four top-level sections:
+
+- `overview`: latest action plus latest backup/health/rollback/notification/restore outcomes
+- `timeline`: recent structured actions with `origin` preserved as `watch`, `hook`, or `manual`
+- `config`: deployment path summary plus last-known per-origin runtime settings
+- `archives`: known-good/last-backup pointers plus archive inventory with roles
+- `setup`: guided readiness checks for environment, output dir, retain count, self-heal, notifications, and preview commands
+
+Exit behavior:
+
+- Healthy path: success requires a healthy status and no backup error.
+- Unhealthy path: success requires a successful rollback restore.
+
+## Local read-only web console
+
+Use `web serve` when you want a browser view on top of the same structured snapshot contract without enabling restore, hook mutation, or config editing:
+
+```sh
+openclaw-phoenix web serve \
+  --config ~/.openclaw/openclaw.json \
+  --output ~/openclaw-backups \
+  --host 127.0.0.1 \
+  --port 48789
+```
+
+The local console is intentionally read-only in this slice:
+
+- `Overview` shows the current protection posture, watch mode, hook install state, latest results, and the latest known-good archive.
+- `Overview` now also explains why Phoenix currently looks healthy, limited, degraded, or failed; why rollback did or did not happen; why notifications did or did not fire; and when the browser view may be stale.
+- `Setup` shows guided prerequisite checks, required vs optional vs advanced settings, hard blockers vs warnings vs info, backup-only vs self-heal readiness, and preview commands you can run manually.
+- `Activity` shows recent Phoenix actions with explicit watch vs hook vs manual origin labels.
+- `Archives` shows the retained archive inventory plus latest-known-good and last-backup roles.
+- `Configuration` shows a read-only deployment/origin summary and any degraded or warning state.
+
+If Phoenix has not recorded any activity yet, the console renders explicit empty states instead of assuming healthy data exists. The Setup page is also preview-only: it explains what command to run next, but the browser does not apply settings. The console also polls the snapshot endpoint to flag stale pages and offer a manual refresh prompt without mutating Phoenix state. If snapshot generation fails for a request, the console returns an explicit error page for that route.
 
 ## Notification behavior
 

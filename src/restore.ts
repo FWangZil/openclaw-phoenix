@@ -12,6 +12,7 @@ import {
   shortenHomePath,
 } from "./paths.js";
 import { resolveWatchPlan } from "./watch-plan.js";
+import { recordPhoenixRestoreAction, type PhoenixActionResult, type PhoenixWebOrigin } from "./web-contract.js";
 
 type RestoreManifestAsset = {
   kind: string;
@@ -52,6 +53,7 @@ export type RestoreArchiveResult = {
   dryRun: boolean;
   restoredPaths: string[];
   verification: BackupVerifyResult;
+  operation: PhoenixActionResult;
 };
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -387,99 +389,201 @@ export async function restoreBackupArchive(options: {
   dryRun?: boolean;
   env?: NodeJS.ProcessEnv;
   openclawBin: string;
+  origin?: PhoenixWebOrigin;
+  recordInWebState?: boolean;
   yes?: boolean;
   log?: (message: string) => void;
   error?: (message: string) => void;
   confirm?: (prompt: string) => Promise<boolean>;
 }): Promise<RestoreArchiveResult> {
+  const startedAt = new Date().toISOString();
   const env = options.env ?? process.env;
   const log = options.log ?? console.log;
   const error = options.error ?? console.error;
   const archivePath = path.resolve(options.archivePath);
+  const outputDir = path.dirname(archivePath);
   const effectiveEnv = {
     ...env,
     ...(options.configPath ? { OPENCLAW_CONFIG_PATH: options.configPath } : {}),
   };
-  const verification = await runOpenClawBackupVerify({
-    openclawBin: options.openclawBin,
-    archivePath,
-    env: effectiveEnv,
-  });
-  const manifest = await readManifestFromArchive(archivePath, verification.archiveRoot);
-  if (manifest.archiveRoot !== verification.archiveRoot) {
-    throw new Error(`Backup manifest archive root mismatch: ${manifest.archiveRoot} !== ${verification.archiveRoot}`);
-  }
-  const watchPlan = await resolveWatchPlan({ configPath: options.configPath, env: effectiveEnv });
-  for (const warning of watchPlan.warnings) {
-    error(warning);
-  }
-  const archiveEntries = await listArchiveEntries(archivePath);
-  const plan = buildRestorePlan({
-    manifest,
-    entries: archiveEntries,
-    stateDir: watchPlan.stateDir,
-    rootConfigPath: watchPlan.rootConfigPath,
-    oauthDir: watchPlan.oauthDir,
-  });
+  try {
+    const verification = await runOpenClawBackupVerify({
+      openclawBin: options.openclawBin,
+      archivePath,
+      env: effectiveEnv,
+    });
+    const manifest = await readManifestFromArchive(archivePath, verification.archiveRoot);
+    if (manifest.archiveRoot !== verification.archiveRoot) {
+      throw new Error(`Backup manifest archive root mismatch: ${manifest.archiveRoot} !== ${verification.archiveRoot}`);
+    }
+    const watchPlan = await resolveWatchPlan({ configPath: options.configPath, env: effectiveEnv });
+    for (const warning of watchPlan.warnings) {
+      error(warning);
+    }
+    const archiveEntries = await listArchiveEntries(archivePath);
+    const plan = buildRestorePlan({
+      manifest,
+      entries: archiveEntries,
+      stateDir: watchPlan.stateDir,
+      rootConfigPath: watchPlan.rootConfigPath,
+      oauthDir: watchPlan.oauthDir,
+    });
 
-  log(`verified archive: ${shortenHomePath(archivePath, effectiveEnv)}`);
-  for (const asset of plan) {
-    log(
-      `${options.dryRun ? "would restore" : "restore target"}: ${shortenHomePath(asset.destinationPath, effectiveEnv)} (${asset.kind})`,
-    );
-  }
+    log(`verified archive: ${shortenHomePath(archivePath, effectiveEnv)}`);
+    for (const asset of plan) {
+      log(
+        `${options.dryRun ? "would restore" : "restore target"}: ${shortenHomePath(asset.destinationPath, effectiveEnv)} (${asset.kind})`,
+      );
+    }
 
-  if (options.dryRun) {
+    if (options.dryRun) {
+      const operation = options.recordInWebState === false
+        ? undefined
+        : await recordPhoenixRestoreAction({
+          origin: options.origin,
+          configPath: options.configPath,
+          outputDir,
+          dryRun: true,
+          startedAt,
+          finishedAt: new Date().toISOString(),
+          archivePath,
+          archiveRoot: verification.archiveRoot,
+          assetCount: plan.length,
+          restoredPaths: [],
+          verification,
+        });
+      return {
+        archivePath,
+        archiveRoot: verification.archiveRoot,
+        assetCount: plan.length,
+        dryRun: true,
+        restoredPaths: [],
+        verification,
+        operation: operation ?? {
+          schemaVersion: 1,
+          id: "internal-restore",
+          origin: options.origin ?? "manual",
+          operation: "restore",
+          status: "ok",
+          startedAt,
+          finishedAt: new Date().toISOString(),
+          summary: `Internal restore dry-run verified ${path.basename(archivePath)}.`,
+          config: {
+            configPath: options.configPath,
+            outputDir,
+            dryRun: true,
+            notification: { enabled: false, policy: "off", targetConfigured: false },
+          },
+          restore: {
+            attempted: true,
+            dryRun: true,
+            archivePath,
+            archiveRoot: verification.archiveRoot,
+            assetCount: plan.length,
+            restoredPaths: [],
+            verification,
+          },
+        },
+      };
+    }
+
+    if (!options.yes) {
+      const confirmed = await (options.confirm ?? promptForConfirmation)(
+        `Restore ${plan.length} archive path${plan.length === 1 ? "" : "s"} into the current OpenClaw deployment?`,
+      );
+      if (!confirmed) {
+        throw new Error("Restore cancelled.");
+      }
+    }
+
+    const restoredPaths: string[] = [];
+    for (const asset of plan.toSorted((left, right) => right.archivePath.length - left.archivePath.length)) {
+      const boundaryRoot = path.dirname(asset.destinationPath);
+      const stageDir = await extractArchiveSelection({
+        archivePath,
+        matches: (entryPath) => isArchivePathWithin(entryPath, asset.archivePath),
+        strip:
+          asset.nodeType === "file"
+            ? countArchiveSegments(path.posix.dirname(asset.archivePath))
+            : countArchiveSegments(asset.archivePath),
+      });
+      try {
+        if (asset.nodeType === "file") {
+          await copyStagedFile(path.join(stageDir, path.posix.basename(asset.archivePath)), asset.destinationPath, boundaryRoot);
+        } else {
+          await copyStagedTree(stageDir, asset.destinationPath, boundaryRoot);
+          await ensureDirectorySafe(asset.destinationPath, boundaryRoot);
+        }
+        restoredPaths.push(asset.destinationPath);
+      } finally {
+        await fs.rm(stageDir, { recursive: true, force: true }).catch(() => undefined);
+      }
+    }
+
+    log(`restored ${restoredPaths.length} archive path${restoredPaths.length === 1 ? "" : "s"}`);
+    const operation = options.recordInWebState === false
+      ? undefined
+      : await recordPhoenixRestoreAction({
+        origin: options.origin,
+        configPath: options.configPath,
+        outputDir,
+        dryRun: false,
+        startedAt,
+        finishedAt: new Date().toISOString(),
+        archivePath,
+        archiveRoot: verification.archiveRoot,
+        assetCount: plan.length,
+        restoredPaths,
+        verification,
+      });
     return {
       archivePath,
       archiveRoot: verification.archiveRoot,
       assetCount: plan.length,
-      dryRun: true,
-      restoredPaths: [],
+      dryRun: false,
+      restoredPaths,
       verification,
+      operation: operation ?? {
+        schemaVersion: 1,
+        id: "internal-restore",
+        origin: options.origin ?? "manual",
+        operation: "restore",
+        status: "ok",
+        startedAt,
+        finishedAt: new Date().toISOString(),
+        summary: `Internal restore applied ${path.basename(archivePath)}.`,
+        config: {
+          configPath: options.configPath,
+          outputDir,
+          dryRun: false,
+          notification: { enabled: false, policy: "off", targetConfigured: false },
+        },
+        restore: {
+          attempted: true,
+          dryRun: false,
+          archivePath,
+          archiveRoot: verification.archiveRoot,
+          assetCount: plan.length,
+          restoredPaths,
+          verification,
+        },
+      },
     };
-  }
-
-  if (!options.yes) {
-    const confirmed = await (options.confirm ?? promptForConfirmation)(
-      `Restore ${plan.length} archive path${plan.length === 1 ? "" : "s"} into the current OpenClaw deployment?`,
-    );
-    if (!confirmed) {
-      throw new Error("Restore cancelled.");
+  } catch (caughtError) {
+    const message = caughtError instanceof Error ? caughtError.message : String(caughtError);
+    if (options.recordInWebState !== false) {
+      await recordPhoenixRestoreAction({
+        origin: options.origin,
+        configPath: options.configPath,
+        outputDir,
+        dryRun: Boolean(options.dryRun),
+        startedAt,
+        finishedAt: new Date().toISOString(),
+        archivePath,
+        restoredPaths: [],
+        error: message,
+      });
     }
+    throw caughtError;
   }
-
-  const restoredPaths: string[] = [];
-  for (const asset of plan.toSorted((left, right) => right.archivePath.length - left.archivePath.length)) {
-    const boundaryRoot = path.dirname(asset.destinationPath);
-    const stageDir = await extractArchiveSelection({
-      archivePath,
-      matches: (entryPath) => isArchivePathWithin(entryPath, asset.archivePath),
-      strip:
-        asset.nodeType === "file"
-          ? countArchiveSegments(path.posix.dirname(asset.archivePath))
-          : countArchiveSegments(asset.archivePath),
-    });
-    try {
-      if (asset.nodeType === "file") {
-        await copyStagedFile(path.join(stageDir, path.posix.basename(asset.archivePath)), asset.destinationPath, boundaryRoot);
-      } else {
-        await copyStagedTree(stageDir, asset.destinationPath, boundaryRoot);
-        await ensureDirectorySafe(asset.destinationPath, boundaryRoot);
-      }
-      restoredPaths.push(asset.destinationPath);
-    } finally {
-      await fs.rm(stageDir, { recursive: true, force: true }).catch(() => undefined);
-    }
-  }
-
-  log(`restored ${restoredPaths.length} archive path${restoredPaths.length === 1 ? "" : "s"}`);
-  return {
-    archivePath,
-    archiveRoot: verification.archiveRoot,
-    assetCount: plan.length,
-    dryRun: false,
-    restoredPaths,
-    verification,
-  };
 }

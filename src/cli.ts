@@ -16,6 +16,8 @@ import { DEFAULT_OPENCLAW_BIN, DEFAULT_OUTPUT_DIR, resolveOutputDir, resolveUser
 import { formatShellCommand, resolvePhoenixCommand } from "./phoenix-command.js";
 import { restoreBackupArchive } from "./restore.js";
 import { DEFAULT_DEBOUNCE_MS, DEFAULT_RETAIN, startBackupWatch } from "./watch.js";
+import { startPhoenixWebConsole } from "./web-console.js";
+import { buildPhoenixWebSnapshot } from "./web-contract.js";
 
 function parsePositiveInteger(value: string, label: string): number {
   const parsed = Number.parseInt(value, 10);
@@ -25,6 +27,13 @@ function parsePositiveInteger(value: string, label: string): number {
   return parsed;
 }
 
+function parsePort(value: string): number {
+  const parsed = Number.parseInt(value, 10);
+  if (!Number.isInteger(parsed) || parsed < 0 || parsed > 65535) {
+    throw new InvalidArgumentError("port must be an integer between 0 and 65535");
+  }
+  return parsed;
+}
 
 type NotificationOptionShape = {
   notify?: PhoenixNotificationMode;
@@ -216,6 +225,73 @@ async function main() {
       process.exitCode = 1;
     }
   });
+  const web = program
+    .command("web")
+    .description("Structured read models and read-only local console for Phoenix");
+  web
+    .command("snapshot")
+    .description("Print the current overview, timeline, config, and archive contract as JSON")
+    .option("--config <path>", "Override OPENCLAW_CONFIG_PATH when resolving Phoenix deployment paths")
+    .option("--output <dir>", "Directory for Phoenix backup archives and state", DEFAULT_OUTPUT_DIR)
+    .option(
+      "--timeline-limit <count>",
+      "How many recent timeline entries to include",
+      (value) => parsePositiveInteger(value, "timeline-limit"),
+      20,
+    )
+    .action(async (options) => {
+      const snapshot = await buildPhoenixWebSnapshot({
+        configPath: options.config ? resolveUserPath(options.config) : undefined,
+        env: process.env,
+        outputDir: resolveOutputDir(options.output),
+        timelineLimit: options.timelineLimit,
+      });
+      console.log(JSON.stringify(snapshot));
+    });
+  web
+    .command("serve")
+    .description("Serve the local read-only Phoenix Web v1 console")
+    .option("--config <path>", "Override OPENCLAW_CONFIG_PATH when resolving Phoenix deployment paths")
+    .option("--output <dir>", "Directory for Phoenix backup archives and state", DEFAULT_OUTPUT_DIR)
+    .option("--host <host>", "Host interface to bind for the local Phoenix console", "127.0.0.1")
+    .option("--port <port>", "Port for the local Phoenix console (0 = random available port)", parsePort, 48789)
+    .option(
+      "--timeline-limit <count>",
+      "How many recent timeline entries to include in the read-only console",
+      (value) => parsePositiveInteger(value, "timeline-limit"),
+      50,
+    )
+    .action(async (options) => {
+      const server = await startPhoenixWebConsole({
+        host: options.host,
+        port: options.port,
+        loadSnapshot: async () => buildPhoenixWebSnapshot({
+          configPath: options.config ? resolveUserPath(options.config) : undefined,
+          env: process.env,
+          outputDir: resolveOutputDir(options.output),
+          timelineLimit: options.timelineLimit,
+        }),
+      });
+      console.log(`Phoenix read-only console listening at ${server.url}`);
+      console.log("Press Ctrl+C to stop.");
+      let shuttingDown = false;
+      const shutdown = async (signal: string) => {
+        if (shuttingDown) {
+          return;
+        }
+        shuttingDown = true;
+        console.log(`received ${signal}; stopping web console`);
+        await server.close();
+        process.exit(0);
+      };
+      process.once("SIGINT", () => {
+        void shutdown("SIGINT");
+      });
+      process.once("SIGTERM", () => {
+        void shutdown("SIGTERM");
+      });
+      await server.closed;
+    });
   await program.parseAsync(process.argv);
 }
 

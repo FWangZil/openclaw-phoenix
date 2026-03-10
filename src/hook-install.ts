@@ -10,7 +10,7 @@ type JsonRecord = Record<string, unknown>;
 export const PHOENIX_HOOK_NAME = "openclaw-phoenix-backup-rollback";
 export const DEFAULT_HOOK_EVENT = "gateway:startup";
 
-type HookInstallRecord = {
+export type PhoenixHookInstallRecord = {
   managedBy: "openclaw-phoenix";
   schemaVersion: 1 | 2 | 3;
   hookName: string;
@@ -109,7 +109,7 @@ async function writeRootConfig(configPath: string, config: JsonRecord): Promise<
 `, "utf8");
 }
 
-function resolveHookDir(stateDir: string): string {
+export function resolvePhoenixHookDir(stateDir: string): string {
   return path.join(stateDir, "hooks", PHOENIX_HOOK_NAME);
 }
 
@@ -117,12 +117,12 @@ function resolveInstallRecordPath(hookDir: string): string {
   return path.join(hookDir, "install-record.json");
 }
 
-async function readInstallRecord(hookDir: string): Promise<HookInstallRecord | null> {
+export async function readPhoenixHookInstallRecord(hookDir: string): Promise<PhoenixHookInstallRecord | null> {
   const raw = await fs.readFile(resolveInstallRecordPath(hookDir), "utf8").catch(() => null);
   if (!raw) {
     return null;
   }
-  const parsed = JSON.parse(raw) as Partial<HookInstallRecord> & { phoenixBin?: string };
+  const parsed = JSON.parse(raw) as Partial<PhoenixHookInstallRecord> & { phoenixBin?: string };
   if (parsed?.managedBy !== "openclaw-phoenix" || parsed?.hookName !== PHOENIX_HOOK_NAME) {
     return null;
   }
@@ -159,7 +159,7 @@ async function assertHookDirOwnedByPhoenix(hookDir: string): Promise<void> {
   if (!stat.isDirectory()) {
     throw new Error(`Refusing to install Phoenix hook over non-directory path: ${hookDir}`);
   }
-  const record = await readInstallRecord(hookDir);
+  const record = await readPhoenixHookInstallRecord(hookDir);
   if (!record) {
     throw new Error(`Refusing to overwrite unmanaged hook directory: ${hookDir}`);
   }
@@ -288,7 +288,7 @@ export async function installPhoenixHook(options: {
 }): Promise<HookInstallResult> {
   const plan = await resolveWatchPlan({ configPath: options.configPath, env: options.env });
   const configPath = plan.rootConfigPath;
-  const hookDir = resolveHookDir(plan.stateDir);
+  const hookDir = resolvePhoenixHookDir(plan.stateDir);
   const eventKey = options.eventKey?.trim() || DEFAULT_HOOK_EVENT;
   if (!eventKey.includes(":")) {
     throw new Error(`hook event must include a type and action (received ${eventKey})`);
@@ -331,7 +331,7 @@ export async function installPhoenixHook(options: {
     }),
     { encoding: "utf8", mode: 0o755 },
   );
-  const record: HookInstallRecord = {
+  const record: PhoenixHookInstallRecord = {
     managedBy: "openclaw-phoenix",
     schemaVersion: 3,
     hookName: PHOENIX_HOOK_NAME,
@@ -354,8 +354,8 @@ export async function removePhoenixHook(options: {
 }): Promise<HookRemoveResult> {
   const plan = await resolveWatchPlan({ configPath: options.configPath, env: options.env });
   const configPath = plan.rootConfigPath;
-  const hookDir = resolveHookDir(plan.stateDir);
-  const record = await readInstallRecord(hookDir);
+  const hookDir = resolvePhoenixHookDir(plan.stateDir);
+  const record = await readPhoenixHookInstallRecord(hookDir);
   const hookDirStat = await fs.stat(hookDir).catch(() => null);
   if (hookDirStat?.isDirectory() && !record) {
     throw new Error(`Refusing to remove unmanaged hook directory: ${hookDir}`);
