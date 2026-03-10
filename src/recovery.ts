@@ -1,6 +1,13 @@
 import fs from "node:fs/promises";
 import path from "node:path";
 import { type OpenClawStatusResult, runOpenClawBackupCreate, runOpenClawStatus } from "./backup.js";
+import {
+  dispatchPhoenixNotifications,
+  selectPhoenixNotificationEvents,
+  type PhoenixNotificationConfig,
+  type PhoenixNotificationDispatch,
+  type PhoenixRecoveryNotificationEvent,
+} from "./notify.js";
 import { pruneBackupArchives, type RetentionResult } from "./retention.js";
 import { restoreBackupArchive } from "./restore.js";
 
@@ -17,12 +24,7 @@ export type PhoenixRecoveryRequest = {
   outputDir: string;
   retain: number;
   env?: NodeJS.ProcessEnv;
-};
-
-export type PhoenixRecoveryNotificationEvent = {
-  code: "rollback-failed" | "rollback-missing-known-good" | "rollback-restored";
-  severity: "error" | "warning";
-  message: string;
+  notification?: PhoenixNotificationConfig;
 };
 
 export type PhoenixRecoveryResult = {
@@ -50,6 +52,7 @@ export type PhoenixRecoveryResult = {
   };
   retention: RetentionResult;
   notifications: PhoenixRecoveryNotificationEvent[];
+  notificationDelivery: PhoenixNotificationDispatch;
   state: PhoenixRecoveryState;
 };
 
@@ -75,7 +78,8 @@ async function readPhoenixRecoveryState(outputDir: string): Promise<PhoenixRecov
 
 async function writePhoenixRecoveryState(outputDir: string, state: PhoenixRecoveryState): Promise<void> {
   await fs.mkdir(outputDir, { recursive: true });
-  await fs.writeFile(resolveStateFilePath(outputDir), `${JSON.stringify(state, null, 2)}\n`, "utf8");
+  await fs.writeFile(resolveStateFilePath(outputDir), `${JSON.stringify(state, null, 2)}
+`, "utf8");
 }
 
 function evaluateStatusHealth(status: OpenClawStatusResult): PhoenixRecoveryResult["health"] {
@@ -202,6 +206,20 @@ export async function runPhoenixRecovery(options: PhoenixRecoveryRequest): Promi
     keep: state.latestKnownGoodArchivePath ? [state.latestKnownGoodArchivePath] : undefined,
   });
   const ok = health.healthy ? !backupError : rollback.restored;
+  const notificationEvents = selectPhoenixNotificationEvents({
+    backupArchivePath,
+    backupError,
+    health,
+    notification: options.notification,
+    notifications,
+    promotedArchivePath,
+  });
+  const notificationDelivery = await dispatchPhoenixNotifications({
+    env: effectiveEnv,
+    events: notificationEvents,
+    notification: options.notification,
+    openclawBin: options.openclawBin,
+  });
 
   return {
     ok,
@@ -219,6 +237,7 @@ export async function runPhoenixRecovery(options: PhoenixRecoveryRequest): Promi
     rollback,
     retention,
     notifications,
+    notificationDelivery,
     state,
   };
 }

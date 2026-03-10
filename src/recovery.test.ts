@@ -26,7 +26,8 @@ async function buildArchiveFixture(options: {
   const tempDir = await makeTempDir("phoenix-recovery-archive-");
   const rootDir = path.join(tempDir, options.archiveRoot);
   await fs.mkdir(rootDir, { recursive: true });
-  await fs.writeFile(path.join(rootDir, "manifest.json"), `${JSON.stringify(options.manifest, null, 2)}\n`, "utf8");
+  await fs.writeFile(path.join(rootDir, "manifest.json"), `${JSON.stringify(options.manifest, null, 2)}
+`, "utf8");
   for (const file of options.files) {
     const targetPath = path.join(tempDir, file.archivePath);
     await fs.mkdir(path.dirname(targetPath), { recursive: true });
@@ -43,6 +44,8 @@ async function createFakeOpenClaw(options: {
   statusModePath: string;
   restoreMarkerPath: string;
   verifyArchiveRoot: string;
+  notificationLogPath?: string;
+  notificationModePath?: string;
 }) {
   const scriptPath = path.join(options.homeDir, "fake-openclaw.mjs");
   await writeExecutableScript(
@@ -78,6 +81,17 @@ if (args[0] === "backup" && args[1] === "verify") {
 if (args[0] === "status" && args[1] === "--json") {
   const mode = (await fs.readFile(${JSON.stringify(options.statusModePath)}, "utf8")).trim();
   console.log(JSON.stringify({ gateway: { reachable: mode === "healthy", misconfigured: false } }));
+  process.exit(0);
+}
+if (args[0] === "gateway" && args[1] === "call" && args[2] === "send") {
+  const mode = ${options.notificationModePath ? `((await fs.readFile(${JSON.stringify(options.notificationModePath)}, "utf8")).trim() || "success")` : '"success"'};
+  if (mode === "fail") {
+    console.error("gateway send unavailable");
+    process.exit(1);
+  }
+  const params = JSON.parse(args[args.indexOf("--params") + 1]);
+  ${options.notificationLogPath ? `await fs.appendFile(${JSON.stringify(options.notificationLogPath)}, JSON.stringify(params) + "\\n", "utf8");` : ''}
+  console.log(JSON.stringify({ ok: true }));
   process.exit(0);
 }
 console.error("unexpected fake openclaw args: " + args.join(" "));
@@ -134,6 +148,7 @@ describe("runPhoenixRecovery", () => {
     expect(result.knownGood.currentArchivePath).toBe(result.backup.archivePath);
     expect(result.knownGood.promotedArchivePath).toBe(result.backup.archivePath);
     expect(result.notifications).toEqual([]);
+    expect(result.notificationDelivery.results).toEqual([]);
     const persistedState = JSON.parse(await fs.readFile(path.join(outputDir, ".openclaw-phoenix-state.json"), "utf8"));
     expect(persistedState.latestKnownGoodArchivePath).toBe(result.backup.archivePath);
   });
@@ -246,5 +261,192 @@ describe("runPhoenixRecovery", () => {
       ]),
     );
     expect(second.retention.deleted).toEqual([]);
+    expect(second.notificationDelivery.results).toEqual([
+      {
+        attempted: false,
+        delivered: false,
+        event: second.notifications[0],
+      },
+    ]);
+  });
+
+  it("dispatches all-policy healthy notifications through openclaw gateway send", async () => {
+    const homeDir = await makeTempDir("phoenix-recovery-notify-healthy-");
+    const outputDir = path.join(homeDir, "archives");
+    const archiveRoot = "2026-03-10T00-00-00.000Z-openclaw-backup";
+    const sourceStateDir = path.join("/tmp", "phoenix-recovery-notify-healthy-state");
+    const healthyArchive = await buildArchiveFixture({
+      archiveRoot,
+      manifest: {
+        schemaVersion: 1,
+        archiveRoot,
+        createdAt: "2026-03-10T00:00:00.000Z",
+        paths: { stateDir: sourceStateDir },
+        assets: [],
+      },
+      files: [],
+    });
+    const archiveQueuePath = path.join(homeDir, "archive-queue.json");
+    const statusModePath = path.join(homeDir, "status-mode.txt");
+    const restoreMarkerPath = path.join(homeDir, "restore-marker.txt");
+    const notificationLogPath = path.join(homeDir, "notification-log.jsonl");
+    await fs.writeFile(archiveQueuePath, JSON.stringify([healthyArchive]), "utf8");
+    await fs.writeFile(statusModePath, "healthy", "utf8");
+    const openclawBin = await createFakeOpenClaw({
+      homeDir,
+      archiveQueuePath,
+      statusModePath,
+      restoreMarkerPath,
+      verifyArchiveRoot: archiveRoot,
+      notificationLogPath,
+    });
+
+    const result = await runPhoenixRecovery({
+      openclawBin,
+      outputDir,
+      retain: 1,
+      env: { ...process.env, HOME: homeDir },
+      notification: {
+        enabled: true,
+        policy: "all",
+        target: {
+          to: "room://operators",
+          channel: "slack",
+          threadId: "incident-thread",
+        },
+      },
+    });
+
+    expect(result.ok).toBe(true);
+    expect(result.notifications).toEqual([]);
+    expect(result.notificationDelivery.results).toHaveLength(1);
+    expect(result.notificationDelivery.results[0]).toMatchObject({
+      attempted: true,
+      delivered: true,
+      event: { code: "healthy", severity: "info" },
+    });
+    const payload = JSON.parse((await fs.readFile(notificationLogPath, "utf8")).trim());
+    expect(payload).toMatchObject({
+      to: "room://operators",
+      channel: "slack",
+      threadId: "incident-thread",
+    });
+    expect(payload.message).toContain("confirmed healthy status");
+  });
+
+  it("keeps rollback success primary when gateway notification delivery fails", async () => {
+    const homeDir = await makeTempDir("phoenix-recovery-notify-fail-");
+    const outputDir = path.join(homeDir, "archives");
+    const currentStateDir = path.join(homeDir, ".openclaw");
+    const liveConfigPath = path.join(currentStateDir, "runtime-config.json");
+    await fs.mkdir(currentStateDir, { recursive: true });
+    await fs.writeFile(liveConfigPath, JSON.stringify({ version: "healthy" }), "utf8");
+    const sourceStateDir = path.join("/tmp", "phoenix-recovery-notify-fail-source");
+    const healthyArchiveRoot = "2026-03-10T00-00-00.000Z-openclaw-backup";
+    const healthyArchive = await buildArchiveFixture({
+      archiveRoot: healthyArchiveRoot,
+      manifest: {
+        schemaVersion: 1,
+        archiveRoot: healthyArchiveRoot,
+        createdAt: "2026-03-10T00:00:00.000Z",
+        paths: {
+          stateDir: sourceStateDir,
+          configPath: path.join(sourceStateDir, "openclaw.json"),
+          oauthDir: path.join(sourceStateDir, "credentials"),
+        },
+        assets: [
+          {
+            kind: "config",
+            sourcePath: path.join(sourceStateDir, "runtime-config.json"),
+            archivePath: buildBackupArchivePath(healthyArchiveRoot, path.join(sourceStateDir, "runtime-config.json")),
+          },
+        ],
+      },
+      files: [
+        {
+          archivePath: buildBackupArchivePath(healthyArchiveRoot, path.join(sourceStateDir, "runtime-config.json")),
+          contents: JSON.stringify({ version: "healthy" }),
+        },
+      ],
+    });
+    const unhealthyArchiveRoot = "2026-03-10T01-00-00.000Z-openclaw-backup";
+    const unhealthyArchive = await buildArchiveFixture({
+      archiveRoot: unhealthyArchiveRoot,
+      manifest: {
+        schemaVersion: 1,
+        archiveRoot: unhealthyArchiveRoot,
+        createdAt: "2026-03-10T01:00:00.000Z",
+        paths: {
+          stateDir: sourceStateDir,
+          configPath: path.join(sourceStateDir, "openclaw.json"),
+          oauthDir: path.join(sourceStateDir, "credentials"),
+        },
+        assets: [
+          {
+            kind: "config",
+            sourcePath: path.join(sourceStateDir, "runtime-config.json"),
+            archivePath: buildBackupArchivePath(unhealthyArchiveRoot, path.join(sourceStateDir, "runtime-config.json")),
+          },
+        ],
+      },
+      files: [
+        {
+          archivePath: buildBackupArchivePath(unhealthyArchiveRoot, path.join(sourceStateDir, "runtime-config.json")),
+          contents: JSON.stringify({ version: "broken-snapshot" }),
+        },
+      ],
+    });
+    const archiveQueuePath = path.join(homeDir, "archive-queue.json");
+    const statusModePath = path.join(homeDir, "status-mode.txt");
+    const restoreMarkerPath = path.join(homeDir, "restore-marker.txt");
+    const notificationModePath = path.join(homeDir, "notification-mode.txt");
+    await fs.writeFile(archiveQueuePath, JSON.stringify([healthyArchive, unhealthyArchive]), "utf8");
+    await fs.writeFile(statusModePath, "healthy", "utf8");
+    await fs.writeFile(notificationModePath, "success", "utf8");
+    const openclawBin = await createFakeOpenClaw({
+      homeDir,
+      archiveQueuePath,
+      statusModePath,
+      restoreMarkerPath,
+      verifyArchiveRoot: healthyArchiveRoot,
+      notificationModePath,
+    });
+
+    await runPhoenixRecovery({
+      openclawBin,
+      outputDir,
+      retain: 1,
+      env: { ...process.env, HOME: homeDir, OPENCLAW_STATE_DIR: currentStateDir },
+    });
+    await fs.writeFile(liveConfigPath, JSON.stringify({ version: "bad" }), "utf8");
+    await fs.writeFile(statusModePath, "unhealthy", "utf8");
+    await fs.writeFile(notificationModePath, "fail", "utf8");
+
+    const result = await runPhoenixRecovery({
+      openclawBin,
+      outputDir,
+      retain: 1,
+      env: { ...process.env, HOME: homeDir, OPENCLAW_STATE_DIR: currentStateDir },
+      notification: {
+        enabled: true,
+        policy: "exceptional-only",
+        target: {
+          to: "room://operators",
+          channel: "signal",
+        },
+      },
+    });
+
+    expect(result.ok).toBe(true);
+    expect(result.rollback.restored).toBe(true);
+    expect(result.notificationDelivery.results).toHaveLength(1);
+    expect(result.notificationDelivery.results[0]).toMatchObject({
+      attempted: true,
+      delivered: false,
+      event: { code: "rollback-restored" },
+    });
+    expect(result.notificationDelivery.results[0]?.error).toContain("openclaw gateway call send");
+    expect(result.notifications[0]?.message).toContain("rolled back");
+    expect(JSON.parse(await fs.readFile(liveConfigPath, "utf8"))).toEqual({ version: "healthy" });
   });
 });

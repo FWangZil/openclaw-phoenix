@@ -1,45 +1,47 @@
-import { type RetentionResult } from "./retention.js";
+import { type PhoenixNotificationConfig, type PhoenixNotificationDispatch } from "./notify.js";
 import { runPhoenixRecovery } from "./recovery.js";
 
-export type PhoenixHookRunResult = {
-  ok: boolean;
-  healthy: boolean;
-  backupArchivePath?: string;
-  backupError?: string;
-  latestKnownGoodArchivePath?: string;
-  healthReason: string;
-  rollback: {
-    attempted: boolean;
-    restored: boolean;
-    archivePath?: string;
-    error?: string;
-  };
-  retention?: RetentionResult;
-  notification?: string;
-};
-
-export async function runPhoenixHook(options: {
+export type PhoenixHookRunOptions = {
   configPath?: string;
   openclawBin: string;
   outputDir: string;
   retain: number;
   env?: NodeJS.ProcessEnv;
-}): Promise<PhoenixHookRunResult> {
-  const recovery = await runPhoenixRecovery(options);
+  notification?: PhoenixNotificationConfig;
+};
+
+export type PhoenixHookRunResult = {
+  ok: boolean;
+  healthy: boolean;
+  backedUpArchivePath?: string;
+  latestKnownGoodArchivePath?: string;
+  healthReason: string;
+  rollbackRestored: boolean;
+  restoredArchivePath?: string;
+  retentionDeleted: string[];
+  notification?: string;
+  notificationDelivery: PhoenixNotificationDispatch;
+};
+
+export async function runPhoenixHook(options: PhoenixHookRunOptions): Promise<PhoenixHookRunResult> {
+  const recovery = await runPhoenixRecovery({
+    configPath: options.configPath,
+    openclawBin: options.openclawBin,
+    outputDir: options.outputDir,
+    retain: options.retain,
+    env: options.env,
+    notification: options.notification,
+  });
   return {
     ok: recovery.ok,
     healthy: recovery.health.healthy,
-    backupArchivePath: recovery.backup.archivePath,
-    backupError: recovery.backup.error,
+    backedUpArchivePath: recovery.backup.archivePath,
     latestKnownGoodArchivePath: recovery.knownGood.currentArchivePath,
     healthReason: recovery.health.reason,
-    rollback: {
-      attempted: recovery.rollback.attempted,
-      restored: recovery.rollback.restored,
-      archivePath: recovery.rollback.archivePath,
-      error: recovery.rollback.error,
-    },
-    retention: recovery.retention,
-    notification: recovery.notifications[0]?.message,
+    rollbackRestored: recovery.rollback.restored,
+    restoredArchivePath: recovery.rollback.archivePath,
+    retentionDeleted: recovery.retention.deleted,
+    notification: recovery.notificationDelivery.results.find((entry) => !entry.delivered)?.event.message,
+    notificationDelivery: recovery.notificationDelivery,
   };
 }

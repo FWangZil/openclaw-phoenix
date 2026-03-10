@@ -1,6 +1,7 @@
 import fs from "node:fs/promises";
 import path from "node:path";
 import JSON5 from "json5";
+import { type PhoenixNotificationConfig } from "./notify.js";
 import { resolveOutputDir } from "./paths.js";
 import { resolveWatchPlan } from "./watch-plan.js";
 
@@ -11,7 +12,7 @@ export const DEFAULT_HOOK_EVENT = "gateway:startup";
 
 type HookInstallRecord = {
   managedBy: "openclaw-phoenix";
-  schemaVersion: 1 | 2;
+  schemaVersion: 1 | 2 | 3;
   hookName: string;
   eventKey: string;
   phoenixCommand: string[];
@@ -19,6 +20,7 @@ type HookInstallRecord = {
   outputDir: string;
   retain: number;
   previousInternalEnabledState: "unset" | "false" | "true";
+  notification?: PhoenixNotificationConfig;
 };
 
 export type HookInstallResult = {
@@ -51,6 +53,37 @@ function deleteIfEmpty(parent: JsonRecord, key: string) {
   }
 }
 
+function trimOptionalString(value: unknown): string | undefined {
+  return typeof value === "string" && value.trim().length > 0 ? value.trim() : undefined;
+}
+
+function readNotificationConfig(value: unknown): PhoenixNotificationConfig | undefined {
+  const record = asRecord(value);
+  if (!record) {
+    return undefined;
+  }
+  const targetRecord = asRecord(record.target);
+  const target = targetRecord
+    ? {
+        to: trimOptionalString(targetRecord.to),
+        channel: trimOptionalString(targetRecord.channel),
+        accountId: trimOptionalString(targetRecord.accountId),
+        threadId: trimOptionalString(targetRecord.threadId),
+      }
+    : undefined;
+  const hasTarget = Boolean(target?.to || target?.channel || target?.accountId || target?.threadId);
+  const policy = record.policy === "all" ? "all" : "exceptional-only";
+  const enabled = record.enabled === true;
+  if (!enabled && !hasTarget) {
+    return undefined;
+  }
+  return {
+    enabled,
+    policy,
+    target: hasTarget ? target : undefined,
+  };
+}
+
 async function readRootConfig(configPath: string): Promise<JsonRecord> {
   const raw = await fs.readFile(configPath, "utf8").catch((error: unknown) => {
     const code = typeof error === "object" && error && "code" in error ? String(error.code) : "";
@@ -72,7 +105,8 @@ async function readRootConfig(configPath: string): Promise<JsonRecord> {
 
 async function writeRootConfig(configPath: string, config: JsonRecord): Promise<void> {
   await fs.mkdir(path.dirname(configPath), { recursive: true });
-  await fs.writeFile(configPath, `${JSON.stringify(config, null, 2)}\n`, "utf8");
+  await fs.writeFile(configPath, `${JSON.stringify(config, null, 2)}
+`, "utf8");
 }
 
 function resolveHookDir(stateDir: string): string {
@@ -102,7 +136,7 @@ async function readInstallRecord(hookDir: string): Promise<HookInstallRecord | n
   }
   return {
     managedBy: "openclaw-phoenix",
-    schemaVersion: parsed.schemaVersion === 1 ? 1 : 2,
+    schemaVersion: parsed.schemaVersion === 1 ? 1 : parsed.schemaVersion === 2 ? 2 : 3,
     hookName: PHOENIX_HOOK_NAME,
     eventKey: typeof parsed.eventKey === "string" && parsed.eventKey.trim() ? parsed.eventKey : DEFAULT_HOOK_EVENT,
     phoenixCommand,
@@ -113,6 +147,7 @@ async function readInstallRecord(hookDir: string): Promise<HookInstallRecord | n
       parsed.previousInternalEnabledState === "false" || parsed.previousInternalEnabledState === "true"
         ? parsed.previousInternalEnabledState
         : "unset",
+    notification: readNotificationConfig(parsed.notification),
   };
 }
 
@@ -131,7 +166,17 @@ async function assertHookDirOwnedByPhoenix(hookDir: string): Promise<void> {
 }
 
 function renderHookReadme(eventKey: string): string {
-  return `---\nname: ${PHOENIX_HOOK_NAME}\ndescription: Backup current OpenClaw state and roll back to the last known-good archive when status is unhealthy.\nevents:\n  - ${eventKey}\n---\n\n# OpenClaw Phoenix Backup + Rollback Hook\n\nManaged by openclaw-phoenix.\n`;
+  return `---
+name: ${PHOENIX_HOOK_NAME}
+description: Backup current OpenClaw state and roll back to the last known-good archive when status is unhealthy.
+events:
+  - ${eventKey}
+---
+
+# OpenClaw Phoenix Backup + Rollback Hook
+
+Managed by openclaw-phoenix.
+`;
 }
 
 function renderHookHandler(options: {
@@ -140,6 +185,7 @@ function renderHookHandler(options: {
   configPath: string;
   outputDir: string;
   retain: number;
+  notification?: PhoenixNotificationConfig;
 }): string {
   const args = [
     "hook",
@@ -154,6 +200,21 @@ function renderHookHandler(options: {
     "--retain",
     String(options.retain),
   ];
+  if (options.notification?.enabled) {
+    args.push("--notify", options.notification.policy);
+    if (options.notification.target?.to) {
+      args.push("--notify-target", options.notification.target.to);
+    }
+    if (options.notification.target?.channel) {
+      args.push("--notify-channel", options.notification.target.channel);
+    }
+    if (options.notification.target?.accountId) {
+      args.push("--notify-account", options.notification.target.accountId);
+    }
+    if (options.notification.target?.threadId) {
+      args.push("--notify-thread-id", options.notification.target.threadId);
+    }
+  }
   return `const { spawn } = require("node:child_process");
 
 const PHOENIX_COMMAND = ${JSON.stringify(options.phoenixCommand)};
@@ -223,6 +284,7 @@ export async function installPhoenixHook(options: {
   retain: number;
   eventKey?: string;
   env?: NodeJS.ProcessEnv;
+  notification?: PhoenixNotificationConfig;
 }): Promise<HookInstallResult> {
   const plan = await resolveWatchPlan({ configPath: options.configPath, env: options.env });
   const configPath = plan.rootConfigPath;
@@ -265,12 +327,13 @@ export async function installPhoenixHook(options: {
       configPath,
       outputDir: resolveOutputDir(options.outputDir),
       retain: options.retain,
+      notification: options.notification,
     }),
     { encoding: "utf8", mode: 0o755 },
   );
   const record: HookInstallRecord = {
     managedBy: "openclaw-phoenix",
-    schemaVersion: 2,
+    schemaVersion: 3,
     hookName: PHOENIX_HOOK_NAME,
     eventKey,
     phoenixCommand: options.phoenixCommand,
@@ -278,8 +341,10 @@ export async function installPhoenixHook(options: {
     outputDir: resolveOutputDir(options.outputDir),
     retain: options.retain,
     previousInternalEnabledState,
+    notification: options.notification,
   };
-  await fs.writeFile(resolveInstallRecordPath(hookDir), `${JSON.stringify(record, null, 2)}\n`, "utf8");
+  await fs.writeFile(resolveInstallRecordPath(hookDir), `${JSON.stringify(record, null, 2)}
+`, "utf8");
   return { configPath, hookDir, eventKey, changed: true };
 }
 

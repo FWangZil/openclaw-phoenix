@@ -3,6 +3,7 @@ import path from "node:path";
 import chokidar from "chokidar";
 import { runOpenClawBackupCreate } from "./backup.js";
 import { DebouncedRunner } from "./debounced-runner.js";
+import { type PhoenixNotificationConfig } from "./notify.js";
 import { normalizePathKey, shortenHomePath } from "./paths.js";
 import { runPhoenixRecovery } from "./recovery.js";
 import { pruneBackupArchives } from "./retention.js";
@@ -19,6 +20,7 @@ export type StartBackupWatchOptions = {
   outputDir: string;
   retain?: number;
   selfHeal?: boolean;
+  notification?: PhoenixNotificationConfig;
   log?: (message: string) => void;
   error?: (message: string) => void;
   signal?: AbortSignal;
@@ -61,6 +63,7 @@ async function runSelfHealWatchCycle(
     outputDir: options.outputDir,
     retain: options.retain ?? DEFAULT_RETAIN,
     env: effectiveEnv,
+    notification: options.notification,
   });
   if (recovery.backup.archivePath) {
     log(`backup complete: ${formatArchivePath(recovery.backup.archivePath, effectiveEnv)}`);
@@ -72,11 +75,17 @@ async function runSelfHealWatchCycle(
   if (recovery.knownGood.promotedArchivePath) {
     log(`latest-known-good updated: ${formatArchivePath(recovery.knownGood.promotedArchivePath, effectiveEnv)}`);
   }
-  for (const notification of recovery.notifications) {
-    if (notification.severity === "error") {
-      error(notification.message);
+  for (const delivery of recovery.notificationDelivery.results) {
+    if (delivery.delivered) {
+      continue;
+    }
+    if (delivery.error) {
+      error(`notification delivery failed (${delivery.event.code}): ${delivery.error}`);
+    }
+    if (delivery.event.severity === "error") {
+      error(delivery.event.message);
     } else {
-      log(notification.message);
+      log(delivery.event.message);
     }
   }
   if (recovery.retention.deleted.length > 0) {

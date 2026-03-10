@@ -3,6 +3,11 @@ import process from "node:process";
 import { Command, InvalidArgumentError } from "commander";
 import { installPhoenixHook, removePhoenixHook, DEFAULT_HOOK_EVENT } from "./hook-install.js";
 import { runPhoenixHook } from "./hook-run.js";
+import {
+  parsePhoenixNotificationMode,
+  resolvePhoenixNotificationConfig,
+  type PhoenixNotificationMode,
+} from "./notify.js";
 import { DEFAULT_OPENCLAW_BIN, DEFAULT_OUTPUT_DIR, resolveOutputDir, resolveUserPath } from "./paths.js";
 import { formatShellCommand, resolvePhoenixCommand } from "./phoenix-command.js";
 import { restoreBackupArchive } from "./restore.js";
@@ -14,6 +19,40 @@ function parsePositiveInteger(value: string, label: string): number {
     throw new InvalidArgumentError(`${label} must be a positive integer`);
   }
   return parsed;
+}
+
+type NotificationOptionShape = {
+  notify?: PhoenixNotificationMode;
+  notifyTarget?: string;
+  notifyChannel?: string;
+  notifyAccount?: string;
+  notifyThreadId?: string;
+};
+
+function addNotificationOptions(command: Command, options: { modeHelp?: string } = {}): Command {
+  return command
+    .option(
+      "--notify <mode>",
+      options.modeHelp ?? "Notification mode for shared recovery summaries (off|exceptional-only|all)",
+      parsePhoenixNotificationMode,
+      "off",
+    )
+    .option("--notify-target <target>", "OpenClaw send target (required for remote notification delivery)")
+    .option("--notify-channel <channel>", "Optional OpenClaw send channel override")
+    .option("--notify-account <id>", "Optional OpenClaw send account override")
+    .option("--notify-thread-id <id>", "Optional OpenClaw send thread identifier");
+}
+
+function resolveNotificationFromOptions(options: NotificationOptionShape) {
+  return resolvePhoenixNotificationConfig({
+    mode: options.notify,
+    target: {
+      to: options.notifyTarget,
+      channel: options.notifyChannel,
+      accountId: options.notifyAccount,
+      threadId: options.notifyThreadId,
+    },
+  });
 }
 
 async function main() {
@@ -35,69 +74,74 @@ async function main() {
         yes: Boolean(options.yes),
       });
     });
-  program
-    .command("watch")
-    .description("Watch OpenClaw config and credential stores, then trigger backup retention cycles")
-    .option("--config <path>", "Override OPENCLAW_CONFIG_PATH for both watcher resolution and spawned backups")
-    .option("--openclaw-bin <path>", "Path to the deployed openclaw binary", DEFAULT_OPENCLAW_BIN)
-    .option("--output <dir>", "Directory for watched backup archives", DEFAULT_OUTPUT_DIR)
-    .option("--retain <count>", "How many recent archives to keep", (value) => parsePositiveInteger(value, "retain"), DEFAULT_RETAIN)
-    .option("--debounce-ms <ms>", "Debounce window before running backup", (value) => parsePositiveInteger(value, "debounce-ms"), DEFAULT_DEBOUNCE_MS)
-    .option("--self-heal", "Opt in to running the shared status/rollback recovery flow after each settled watch cycle", false)
-    .action(async (options) => {
-      const session = await startBackupWatch({
-        configPath: options.config ? resolveUserPath(options.config) : undefined,
-        debounceMs: options.debounceMs,
-        openclawBin: options.openclawBin,
-        outputDir: resolveOutputDir(options.output),
-        retain: options.retain,
-        selfHeal: Boolean(options.selfHeal),
-      });
-      let shuttingDown = false;
-      const shutdown = async (signal: string) => {
-        if (shuttingDown) {
-          return;
-        }
-        shuttingDown = true;
-        console.log(`received ${signal}; stopping watch`);
-        await session.close();
-        process.exit(0);
-      };
-      process.once("SIGINT", () => {
-        void shutdown("SIGINT");
-      });
-      process.once("SIGTERM", () => {
-        void shutdown("SIGTERM");
-      });
-      await session.closed;
+  addNotificationOptions(
+    program
+      .command("watch")
+      .description("Watch OpenClaw config and credential stores, then trigger backup retention cycles (backup-only by default)")
+      .option("--config <path>", "Override OPENCLAW_CONFIG_PATH for both watcher resolution and spawned backups")
+      .option("--openclaw-bin <path>", "Path to the deployed openclaw binary", DEFAULT_OPENCLAW_BIN)
+      .option("--output <dir>", "Directory for watched backup archives", DEFAULT_OUTPUT_DIR)
+      .option("--retain <count>", "How many recent archives to keep", (value) => parsePositiveInteger(value, "retain"), DEFAULT_RETAIN)
+      .option("--debounce-ms <ms>", "Debounce window before running backup", (value) => parsePositiveInteger(value, "debounce-ms"), DEFAULT_DEBOUNCE_MS)
+      .option("--self-heal", "Opt in to running the shared status/rollback recovery flow after each settled watch cycle", false),
+    { modeHelp: "Notification mode for shared recovery summaries (watch requires --self-heal; off|exceptional-only|all)" },
+  ).action(async (options) => {
+    const session = await startBackupWatch({
+      configPath: options.config ? resolveUserPath(options.config) : undefined,
+      debounceMs: options.debounceMs,
+      openclawBin: options.openclawBin,
+      outputDir: resolveOutputDir(options.output),
+      retain: options.retain,
+      selfHeal: Boolean(options.selfHeal),
+      notification: resolveNotificationFromOptions(options),
     });
+    let shuttingDown = false;
+    const shutdown = async (signal: string) => {
+      if (shuttingDown) {
+        return;
+      }
+      shuttingDown = true;
+      console.log(`received ${signal}; stopping watch`);
+      await session.close();
+      process.exit(0);
+    };
+    process.once("SIGINT", () => {
+      void shutdown("SIGINT");
+    });
+    process.once("SIGTERM", () => {
+      void shutdown("SIGTERM");
+    });
+    await session.closed;
+  });
   const hook = program.command("hook").description("Install or run the managed OpenClaw Phoenix hook");
-  hook
-    .command("install")
-    .description("Install the managed OpenClaw hook that triggers backup/status/rollback")
-    .option("--config <path>", "Override OPENCLAW_CONFIG_PATH when updating the deployed OpenClaw config")
-    .option("--openclaw-bin <path>", "Path to the deployed openclaw binary that the hook should invoke", DEFAULT_OPENCLAW_BIN)
-    .option("--phoenix-bin <path>", "Path to the openclaw-phoenix executable or CLI entrypoint to invoke from the hook")
-    .option("--output <dir>", "Directory for Phoenix hook backup archives", DEFAULT_OUTPUT_DIR)
-    .option("--retain <count>", "How many recent archives to keep", (value) => parsePositiveInteger(value, "retain"), DEFAULT_RETAIN)
-    .option("--event <event>", "OpenClaw internal hook event key to subscribe to", DEFAULT_HOOK_EVENT)
-    .action(async (options) => {
-      const phoenixCommand = resolvePhoenixCommand({
-        phoenixBin: options.phoenixBin,
-        argv: process.argv,
-      });
-      const result = await installPhoenixHook({
-        configPath: options.config ? resolveUserPath(options.config) : undefined,
-        phoenixCommand,
-        openclawBin: options.openclawBin,
-        outputDir: resolveOutputDir(options.output),
-        retain: options.retain,
-        eventKey: options.event,
-      });
-      console.log(`installed ${result.eventKey} -> ${result.hookDir}`);
-      console.log(`updated ${result.configPath}`);
-      console.log(`handler command: ${formatShellCommand(phoenixCommand)}`);
+  addNotificationOptions(
+    hook
+      .command("install")
+      .description("Install the managed OpenClaw hook that triggers backup/status/rollback")
+      .option("--config <path>", "Override OPENCLAW_CONFIG_PATH when updating the deployed OpenClaw config")
+      .option("--openclaw-bin <path>", "Path to the deployed openclaw binary that the hook should invoke", DEFAULT_OPENCLAW_BIN)
+      .option("--phoenix-bin <path>", "Path to the openclaw-phoenix executable or CLI entrypoint to invoke from the hook")
+      .option("--output <dir>", "Directory for Phoenix hook backup archives", DEFAULT_OUTPUT_DIR)
+      .option("--retain <count>", "How many recent archives to keep", (value) => parsePositiveInteger(value, "retain"), DEFAULT_RETAIN)
+      .option("--event <event>", "OpenClaw internal hook event key to subscribe to", DEFAULT_HOOK_EVENT),
+  ).action(async (options) => {
+    const phoenixCommand = resolvePhoenixCommand({
+      phoenixBin: options.phoenixBin,
+      argv: process.argv,
     });
+    const result = await installPhoenixHook({
+      configPath: options.config ? resolveUserPath(options.config) : undefined,
+      phoenixCommand,
+      openclawBin: options.openclawBin,
+      outputDir: resolveOutputDir(options.output),
+      retain: options.retain,
+      eventKey: options.event,
+      notification: resolveNotificationFromOptions(options),
+    });
+    console.log(`installed ${result.eventKey} -> ${result.hookDir}`);
+    console.log(`updated ${result.configPath}`);
+    console.log(`handler command: ${formatShellCommand(phoenixCommand)}`);
+  });
   hook
     .command("remove")
     .description("Remove the managed OpenClaw Phoenix hook without disturbing unrelated hooks")
@@ -109,37 +153,39 @@ async function main() {
       console.log(`removed ${result.hookDir}`);
       console.log(`updated ${result.configPath}`);
     });
-  hook
-    .command("run")
-    .description("Internal: run the backup/status/rollback flow used by the managed hook")
-    .option("--config <path>", "Override OPENCLAW_CONFIG_PATH when running the Phoenix hook flow")
-    .option("--openclaw-bin <path>", "Path to the deployed openclaw binary", DEFAULT_OPENCLAW_BIN)
-    .option("--output <dir>", "Directory for hook backup archives", DEFAULT_OUTPUT_DIR)
-    .option("--retain <count>", "How many recent archives to keep", (value) => parsePositiveInteger(value, "retain"), DEFAULT_RETAIN)
-    .option("--json", "Print the hook run summary as JSON", false)
-    .action(async (options) => {
-      const result = await runPhoenixHook({
-        configPath: options.config ? resolveUserPath(options.config) : undefined,
-        openclawBin: options.openclawBin,
-        outputDir: resolveOutputDir(options.output),
-        retain: options.retain,
-      });
-      if (options.json) {
-        console.log(JSON.stringify(result));
-      } else {
-        console.log(`backup: ${result.backupArchivePath ?? "not created"}`);
-        console.log(`health: ${result.healthy ? "healthy" : "unhealthy"} (${result.healthReason})`);
-        if (result.latestKnownGoodArchivePath) {
-          console.log(`latest-known-good: ${result.latestKnownGoodArchivePath}`);
-        }
-        if (result.notification) {
-          console.log(result.notification);
-        }
-      }
-      if (!result.ok) {
-        process.exitCode = 1;
-      }
+  addNotificationOptions(
+    hook
+      .command("run")
+      .description("Internal: run the backup/status/rollback flow used by the managed hook")
+      .option("--config <path>", "Override OPENCLAW_CONFIG_PATH when running the Phoenix hook flow")
+      .option("--openclaw-bin <path>", "Path to the deployed openclaw binary", DEFAULT_OPENCLAW_BIN)
+      .option("--output <dir>", "Directory for hook backup archives", DEFAULT_OUTPUT_DIR)
+      .option("--retain <count>", "How many recent archives to keep", (value) => parsePositiveInteger(value, "retain"), DEFAULT_RETAIN)
+      .option("--json", "Print the hook run summary as JSON", false),
+  ).action(async (options) => {
+    const result = await runPhoenixHook({
+      configPath: options.config ? resolveUserPath(options.config) : undefined,
+      openclawBin: options.openclawBin,
+      outputDir: resolveOutputDir(options.output),
+      retain: options.retain,
+      notification: resolveNotificationFromOptions(options),
     });
+    if (options.json) {
+      console.log(JSON.stringify(result));
+    } else {
+      console.log(`backup: ${result.backedUpArchivePath ?? "not created"}`);
+      console.log(`health: ${result.healthy ? "healthy" : "unhealthy"} (${result.healthReason})`);
+      if (result.latestKnownGoodArchivePath) {
+        console.log(`latest-known-good: ${result.latestKnownGoodArchivePath}`);
+      }
+      if (result.notification) {
+        console.log(result.notification);
+      }
+    }
+    if (!result.ok) {
+      process.exitCode = 1;
+    }
+  });
   await program.parseAsync(process.argv);
 }
 

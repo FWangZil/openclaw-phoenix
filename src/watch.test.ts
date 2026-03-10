@@ -49,6 +49,8 @@ async function createFakeOpenClaw(options: {
   restoreMarkerPath: string;
   commandLogPath: string;
   verifyArchiveRoot: string;
+  notificationLogPath?: string;
+  notificationModePath?: string;
 }) {
   const scriptPath = path.join(options.homeDir, "fake-openclaw.mjs");
   await writeExecutableScript(
@@ -97,6 +99,18 @@ if (args[0] === "status" && args[1] === "--json") {
   console.log(JSON.stringify({ gateway: { reachable: mode === "healthy", misconfigured: false } }));
   process.exit(0);
 }
+if (args[0] === "gateway" && args[1] === "call" && args[2] === "send") {
+  await appendLog("gateway call send");
+  const mode = ${options.notificationModePath ? `((await fs.readFile(${JSON.stringify(options.notificationModePath)}, "utf8")).trim() || "success")` : '"success"'};
+  if (mode === "fail") {
+    console.error("gateway send unavailable");
+    process.exit(1);
+  }
+  const params = JSON.parse(args[args.indexOf("--params") + 1]);
+  ${options.notificationLogPath ? `await fs.appendFile(${JSON.stringify(options.notificationLogPath)}, JSON.stringify(params) + "\\n", "utf8");` : ""}
+  console.log(JSON.stringify({ ok: true }));
+  process.exit(0);
+}
 console.error("unexpected fake openclaw args: " + args.join(" "));
 process.exit(1);
 `,
@@ -135,7 +149,7 @@ afterEach(async () => {
 });
 
 describe("startBackupWatch", () => {
-  it("keeps watch backup-only by default", async () => {
+  it("keeps watch backup-only by default and does not dispatch shared recovery notifications", async () => {
     const homeDir = await makeTempDir("phoenix-watch-default-");
     const stateDir = path.join(homeDir, ".openclaw");
     const outputDir = path.join(homeDir, "archives");
@@ -159,6 +173,7 @@ describe("startBackupWatch", () => {
     const statusModePath = path.join(homeDir, "status-mode.txt");
     const restoreMarkerPath = path.join(homeDir, "restore-marker.txt");
     const commandLogPath = path.join(homeDir, "command-log.txt");
+    const notificationLogPath = path.join(homeDir, "notification-log.jsonl");
     await fs.writeFile(archiveQueuePath, JSON.stringify([archivePath]), "utf8");
     await fs.writeFile(statusModePath, "healthy", "utf8");
     const openclawBin = await createFakeOpenClaw({
@@ -168,6 +183,7 @@ describe("startBackupWatch", () => {
       restoreMarkerPath,
       commandLogPath,
       verifyArchiveRoot: archiveRoot,
+      notificationLogPath,
     });
     const logs: string[] = [];
     const session = await startBackupWatch({
@@ -177,6 +193,13 @@ describe("startBackupWatch", () => {
       openclawBin,
       outputDir,
       retain: 1,
+      notification: {
+        enabled: true,
+        policy: "all",
+        target: {
+          to: "room://operators",
+        },
+      },
       log: (message) => logs.push(message),
     });
     sessions.push(session);
@@ -187,7 +210,84 @@ describe("startBackupWatch", () => {
 
     expect(await readCommandLog(commandLogPath)).toEqual(["backup create"]);
     expect(await fileExists(path.join(outputDir, ".openclaw-phoenix-state.json"))).toBe(false);
+    expect(await fileExists(notificationLogPath)).toBe(false);
     expect(logs).toContain("watch mode: backup-only");
+  }, 15_000);
+
+  it("dispatches all-policy healthy notifications when watch self-heal is enabled", async () => {
+    const homeDir = await makeTempDir("phoenix-watch-heal-notify-");
+    const stateDir = path.join(homeDir, ".openclaw");
+    const outputDir = path.join(homeDir, "archives");
+    const configPath = path.join(stateDir, "openclaw.json");
+    await fs.mkdir(stateDir, { recursive: true });
+    await rewriteConfig(configPath, 0);
+    const archiveRoot = "2026-03-10T00-00-00.000Z-openclaw-backup";
+    const sourceStateDir = path.join("/tmp", "phoenix-watch-heal-notify-source");
+    const archivePath = await buildArchiveFixture({
+      archiveRoot,
+      manifest: {
+        schemaVersion: 1,
+        archiveRoot,
+        createdAt: "2026-03-10T00:00:00.000Z",
+        paths: { stateDir: sourceStateDir },
+        assets: [],
+      },
+      files: [],
+    });
+    const archiveQueuePath = path.join(homeDir, "archive-queue.json");
+    const statusModePath = path.join(homeDir, "status-mode.txt");
+    const restoreMarkerPath = path.join(homeDir, "restore-marker.txt");
+    const commandLogPath = path.join(homeDir, "command-log.txt");
+    const notificationLogPath = path.join(homeDir, "notification-log.jsonl");
+    await fs.writeFile(archiveQueuePath, JSON.stringify([archivePath]), "utf8");
+    await fs.writeFile(statusModePath, "healthy", "utf8");
+    const openclawBin = await createFakeOpenClaw({
+      homeDir,
+      archiveQueuePath,
+      statusModePath,
+      restoreMarkerPath,
+      commandLogPath,
+      verifyArchiveRoot: archiveRoot,
+      notificationLogPath,
+    });
+    const logs: string[] = [];
+    const session = await startBackupWatch({
+      configPath,
+      debounceMs: 40,
+      env: { ...process.env, HOME: homeDir, OPENCLAW_STATE_DIR: stateDir, VITEST: "true" },
+      openclawBin,
+      outputDir,
+      retain: 1,
+      selfHeal: true,
+      notification: {
+        enabled: true,
+        policy: "all",
+        target: {
+          to: "room://operators",
+          channel: "slack",
+          threadId: "watch-thread",
+        },
+      },
+      log: (message) => logs.push(message),
+    });
+    sessions.push(session);
+
+    await new Promise((resolve) => setTimeout(resolve, 150));
+    await rewriteConfig(configPath, 1);
+    await waitFor(async () => await fileExists(notificationLogPath));
+
+    const commandLog = await readCommandLog(commandLogPath);
+    expect(commandLog).toEqual(expect.arrayContaining(["backup create", "status", "gateway call send"]));
+    expect(await fileExists(path.join(outputDir, ".openclaw-phoenix-state.json"))).toBe(true);
+    expect(logs).toContain("watch mode: self-heal");
+
+    const payload = JSON.parse((await fs.readFile(notificationLogPath, "utf8")).trim());
+    expect(payload).toMatchObject({
+      to: "room://operators",
+      channel: "slack",
+      threadId: "watch-thread",
+    });
+    expect(payload.message).toContain("confirmed healthy status");
   }, 15_000);
 
   it("routes opt-in watch self-heal cycles through shared recovery and rolls back unhealthy snapshots", async () => {

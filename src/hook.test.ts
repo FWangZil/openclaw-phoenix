@@ -282,4 +282,53 @@ exec node --import tsx ${JSON.stringify(path.resolve("src/cli.ts"))} "$@"
     expect(handler).toContain('const PHOENIX_COMMAND = ["/opt/node/bin/node","--import","tsx"');
     expect(handler).toContain(JSON.stringify(path.resolve("src/cli.ts")));
   });
+
+
+  it("persists configured notification target options into the managed hook handler", async () => {
+    const homeDir = await makeTempDir("phoenix-hook-notify-home-");
+    const stateDir = path.join(homeDir, ".openclaw");
+    const configPath = path.join(stateDir, "openclaw.json");
+    await fs.mkdir(stateDir, { recursive: true });
+    await fs.writeFile(configPath, "{}\n", "utf8");
+    const outputDir = path.join(homeDir, "archives");
+    const fakeOpenClawPath = path.join(homeDir, "fake-openclaw.sh");
+    await writeExecutableScript(fakeOpenClawPath, "#!/usr/bin/env bash\nexit 0\n");
+
+    await installPhoenixHook({
+      configPath,
+      phoenixCommand: ["/usr/bin/env", "node", "phoenix.js"],
+      openclawBin: fakeOpenClawPath,
+      outputDir,
+      retain: 2,
+      notification: {
+        enabled: true,
+        policy: "all",
+        target: {
+          to: "room://ops",
+          channel: "slack",
+          accountId: "acct-1",
+          threadId: "thread-1",
+        },
+      },
+    });
+
+    const hookDir = path.join(stateDir, "hooks", PHOENIX_HOOK_NAME);
+    const handler = await fs.readFile(path.join(hookDir, "handler.js"), "utf8");
+    const record = JSON.parse(await fs.readFile(path.join(hookDir, "install-record.json"), "utf8"));
+    expect(handler).toContain('"--notify","all"');
+    expect(handler).toContain('"--notify-target","room://ops"');
+    expect(handler).toContain('"--notify-channel","slack"');
+    expect(handler).toContain('"--notify-account","acct-1"');
+    expect(handler).toContain('"--notify-thread-id","thread-1"');
+    expect(record.notification).toEqual({
+      enabled: true,
+      policy: "all",
+      target: {
+        to: "room://ops",
+        channel: "slack",
+        accountId: "acct-1",
+        threadId: "thread-1",
+      },
+    });
+  });
 });

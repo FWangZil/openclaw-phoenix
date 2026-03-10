@@ -35,6 +35,7 @@ node dist/cli.js --help
 
 - `openclaw-phoenix watch`
   - Long-running watcher for config/auth changes.
+  - Default behavior is backup-only; add `--self-heal` to run the shared backup/status/rollback flow.
   - Runs `openclaw backup create --output ... --json` after debounced changes and then prunes old archives.
 - `openclaw-phoenix restore <archive>`
   - Verifies an archive with `openclaw backup verify <archive> --json` and restores it into the *current* deployment paths.
@@ -118,6 +119,8 @@ What `watch` does:
 Operational notes:
 
 - `watch` is **change-driven**. It does not create an initial backup on startup.
+- `watch` is **backup-only by default**. Add `--self-heal` to switch each settled watch cycle into the same shared recovery flow used by `hook run`.
+- `watch --notify ...` only has an effect when `--self-heal` is enabled. Backup-only watch cycles only run backup creation plus retention pruning.
 - If the root config file changes, Phoenix refreshes the derived watch target set before the next backup cycle.
 - Invalid/missing config-derived paths are reported as warnings; the watcher stays up and continues watching the base paths it can resolve.
 - A failed backup cycle logs an error but does not terminate the watch session.
@@ -232,6 +235,8 @@ At runtime it:
 
    `hook run --json --config ... --openclaw-bin ... --output ... --retain ...`
 
+   and any configured `--notify*` flags.
+
 2. Collects stdout/stderr from that child process.
 3. Parses stdout as JSON when possible.
 4. If the OpenClaw hook event object has a `messages` array and Phoenix returned a notification, pushes that notification into `event.messages`.
@@ -280,6 +285,22 @@ Exit behavior:
 
 - Healthy path: success requires a healthy status and no backup error.
 - Unhealthy path: success requires a successful rollback restore.
+
+## Notification behavior
+
+Phoenix only emits notification summaries from the shared recovery flow used by `hook run` and `watch --self-heal`.
+
+Defaults and requirements:
+
+- Default: `--notify off`
+- Modes:
+  - `off`: do not attempt remote delivery
+  - `exceptional-only`: send only unhealthy rollback/missing-known-good summaries
+  - `all`: also send healthy promotion summaries
+- Remote delivery requires `--notify-target <target>`.
+- `--notify-channel`, `--notify-account`, and `--notify-thread-id` are optional routing hints passed through to `openclaw gateway call send`.
+- Passing target flags without `--notify exceptional-only` or `--notify all` does **not** enable delivery.
+- If notification delivery fails, Phoenix keeps the underlying recovery result (`ok`, rollback state, latest-known-good promotion) and reports the delivery failure separately.
 
 ## Health-check semantics
 
