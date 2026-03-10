@@ -43,6 +43,7 @@ async function main() {
     .option("--output <dir>", "Directory for watched backup archives", DEFAULT_OUTPUT_DIR)
     .option("--retain <count>", "How many recent archives to keep", (value) => parsePositiveInteger(value, "retain"), DEFAULT_RETAIN)
     .option("--debounce-ms <ms>", "Debounce window before running backup", (value) => parsePositiveInteger(value, "debounce-ms"), DEFAULT_DEBOUNCE_MS)
+    .option("--self-heal", "Opt in to running the shared status/rollback recovery flow after each settled watch cycle", false)
     .action(async (options) => {
       const session = await startBackupWatch({
         configPath: options.config ? resolveUserPath(options.config) : undefined,
@@ -50,6 +51,7 @@ async function main() {
         openclawBin: options.openclawBin,
         outputDir: resolveOutputDir(options.output),
         retain: options.retain,
+        selfHeal: Boolean(options.selfHeal),
       });
       let shuttingDown = false;
       const shutdown = async (signal: string) => {

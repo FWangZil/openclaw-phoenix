@@ -4,28 +4,87 @@ import chokidar from "chokidar";
 import { runOpenClawBackupCreate } from "./backup.js";
 import { DebouncedRunner } from "./debounced-runner.js";
 import { normalizePathKey, shortenHomePath } from "./paths.js";
+import { runPhoenixRecovery } from "./recovery.js";
 import { pruneBackupArchives } from "./retention.js";
 import { type WatchPlan, resolveWatchPlan } from "./watch-plan.js";
 
 export const DEFAULT_DEBOUNCE_MS = 1_000;
 export const DEFAULT_RETAIN = 100;
 
-export type BackupWatchSession = {
-  close: () => Promise<void>;
-  closed: Promise<void>;
-};
-
-export async function startBackupWatch(options: {
+export type StartBackupWatchOptions = {
   configPath?: string;
   debounceMs?: number;
   env?: NodeJS.ProcessEnv;
   openclawBin: string;
   outputDir: string;
   retain?: number;
+  selfHeal?: boolean;
   log?: (message: string) => void;
   error?: (message: string) => void;
   signal?: AbortSignal;
-}): Promise<BackupWatchSession> {
+};
+
+export type BackupWatchSession = {
+  close: () => Promise<void>;
+  closed: Promise<void>;
+};
+
+function formatArchivePath(archivePath: string | undefined, env: NodeJS.ProcessEnv): string {
+  return archivePath ? shortenHomePath(archivePath, env) : "(path unavailable)";
+}
+
+async function runBackupOnlyWatchCycle(options: StartBackupWatchOptions, effectiveEnv: NodeJS.ProcessEnv, log: (message: string) => void) {
+  const result = await runOpenClawBackupCreate({
+    openclawBin: options.openclawBin,
+    outputDir: `${options.outputDir}${path.sep}`,
+    env: effectiveEnv,
+  });
+  const retention = await pruneBackupArchives({
+    directory: options.outputDir,
+    retain: options.retain ?? DEFAULT_RETAIN,
+  });
+  log(`backup complete: ${formatArchivePath(result.archivePath, effectiveEnv)}`);
+  if (retention.deleted.length > 0) {
+    log(`retention pruned ${retention.deleted.length} old archive(s)`);
+  }
+}
+
+async function runSelfHealWatchCycle(
+  options: StartBackupWatchOptions,
+  effectiveEnv: NodeJS.ProcessEnv,
+  log: (message: string) => void,
+  error: (message: string) => void,
+) {
+  const recovery = await runPhoenixRecovery({
+    configPath: options.configPath,
+    openclawBin: options.openclawBin,
+    outputDir: options.outputDir,
+    retain: options.retain ?? DEFAULT_RETAIN,
+    env: effectiveEnv,
+  });
+  if (recovery.backup.archivePath) {
+    log(`backup complete: ${formatArchivePath(recovery.backup.archivePath, effectiveEnv)}`);
+  }
+  if (recovery.backup.error) {
+    error(`backup cycle failed: ${recovery.backup.error}`);
+  }
+  log(`health: ${recovery.health.healthy ? "healthy" : "unhealthy"} (${recovery.health.reason})`);
+  if (recovery.knownGood.promotedArchivePath) {
+    log(`latest-known-good updated: ${formatArchivePath(recovery.knownGood.promotedArchivePath, effectiveEnv)}`);
+  }
+  for (const notification of recovery.notifications) {
+    if (notification.severity === "error") {
+      error(notification.message);
+    } else {
+      log(notification.message);
+    }
+  }
+  if (recovery.retention.deleted.length > 0) {
+    log(`retention pruned ${recovery.retention.deleted.length} old archive(s)`);
+  }
+}
+
+export async function startBackupWatch(options: StartBackupWatchOptions): Promise<BackupWatchSession> {
   const log = options.log ?? console.log;
   const error = options.error ?? console.error;
   const env = options.env ?? process.env;
@@ -89,24 +148,13 @@ export async function startBackupWatch(options: {
   const runner = new DebouncedRunner(options.debounceMs ?? DEFAULT_DEBOUNCE_MS, async () => {
     try {
       await queueRefresh();
-      const result = await runOpenClawBackupCreate({
-        openclawBin: options.openclawBin,
-        outputDir: `${options.outputDir}${path.sep}`,
-        env: effectiveEnv,
-      });
-      const retention = await pruneBackupArchives({
-        directory: options.outputDir,
-        retain: options.retain ?? DEFAULT_RETAIN,
-      });
-      const archivePath = result.archivePath
-        ? shortenHomePath(result.archivePath, effectiveEnv)
-        : "(path unavailable)";
-      log(`backup complete: ${archivePath}`);
-      if (retention.deleted.length > 0) {
-        log(`retention pruned ${retention.deleted.length} old archive(s)`);
+      if (options.selfHeal) {
+        await runSelfHealWatchCycle(options, effectiveEnv, log, error);
+      } else {
+        await runBackupOnlyWatchCycle(options, effectiveEnv, log);
       }
     } catch (backupError) {
-      error(`backup cycle failed: ${String(backupError)}`);
+      error(`${options.selfHeal ? "self-heal" : "backup"} cycle failed: ${String(backupError)}`);
     }
   });
   watcher.on("all", (_event, changedPath) => {
@@ -126,6 +174,7 @@ export async function startBackupWatch(options: {
   });
   log(`watching ${currentPlan.targets.length} path(s) for backup changes`);
   log(`output directory: ${shortenHomePath(options.outputDir, effectiveEnv)}`);
+  log(`watch mode: ${options.selfHeal ? "self-heal" : "backup-only"}`);
   const close = async () => {
     runner.close();
     await watcher.close();
