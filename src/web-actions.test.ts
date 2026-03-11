@@ -101,6 +101,10 @@ describe("createPhoenixWebActionController", () => {
       operation: "backup-cycle",
       status: "ok",
     });
+    expect(snapshot.overview.latestWebAction?.result).toMatchObject({
+      trigger: { source: "web-console", request: "backup-now" },
+      operation: "backup-cycle",
+    });
     expect(snapshot.overview.latestAction?.backup?.archivePath).toContain(`manual-web${OPENCLAW_BACKUP_ARCHIVE_SUFFIX}`);
   });
 
@@ -127,6 +131,10 @@ describe("createPhoenixWebActionController", () => {
       origin: "manual",
       operation: "health-check",
       status: "warning",
+    });
+    expect(snapshot.overview.latestWebAction?.result).toMatchObject({
+      trigger: { source: "web-console", request: "health-check-now" },
+      operation: "health-check",
     });
     expect(snapshot.overview.latestHealth?.result).toMatchObject({
       attempted: true,

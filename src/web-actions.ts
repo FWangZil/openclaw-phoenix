@@ -9,9 +9,14 @@ import {
   recordPhoenixHealthCheckAction,
   type PhoenixActionResult,
   type PhoenixWebActionStatus,
+  type PhoenixWebActionTrigger,
 } from "./web-contract.js";
 
 export type PhoenixWebManualAction = "backup-now" | "health-check-now";
+
+function manualActionTrigger(action: PhoenixWebManualAction): PhoenixWebActionTrigger {
+  return { source: "web-console", request: action };
+}
 
 export type PhoenixWebActionState = {
   running?: {
@@ -65,6 +70,7 @@ async function runManualBackup(options: CreatePhoenixWebActionControllerOptions)
     });
     return recordPhoenixBackupAction({
       origin: "manual",
+      trigger: manualActionTrigger("backup-now"),
       configPath: options.configPath,
       outputDir: options.outputDir,
       retain: options.retain,
@@ -79,6 +85,7 @@ async function runManualBackup(options: CreatePhoenixWebActionControllerOptions)
   } catch (error) {
     return recordPhoenixBackupAction({
       origin: "manual",
+      trigger: manualActionTrigger("backup-now"),
       configPath: options.configPath,
       outputDir: options.outputDir,
       retain: options.retain,
@@ -106,6 +113,7 @@ async function runManualHealthCheck(options: CreatePhoenixWebActionControllerOpt
     const health = evaluateOpenClawStatusHealth(status);
     return recordPhoenixHealthCheckAction({
       origin: "manual",
+      trigger: manualActionTrigger("health-check-now"),
       configPath: options.configPath,
       outputDir: options.outputDir,
       startedAt,
@@ -120,6 +128,7 @@ async function runManualHealthCheck(options: CreatePhoenixWebActionControllerOpt
   } catch (error) {
     return recordPhoenixHealthCheckAction({
       origin: "manual",
+      trigger: manualActionTrigger("health-check-now"),
       configPath: options.configPath,
       outputDir: options.outputDir,
       startedAt,
@@ -192,6 +201,7 @@ export function createPhoenixWebActionController(
                 origin: "manual",
                 operation: action === "backup-now" ? "backup-cycle" : "health-check",
                 status: "error",
+                trigger: manualActionTrigger(action),
                 startedAt: running.startedAt,
                 finishedAt: failedAt,
                 summary: String(error),

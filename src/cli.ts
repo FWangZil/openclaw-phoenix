@@ -17,7 +17,7 @@ import { formatShellCommand, resolvePhoenixCommand } from "./phoenix-command.js"
 import { restoreBackupArchive } from "./restore.js";
 import { DEFAULT_DEBOUNCE_MS, DEFAULT_RETAIN, startBackupWatch } from "./watch.js";
 import { createPhoenixWebActionController } from "./web-actions.js";
-import { startPhoenixWebConsole } from "./web-console.js";
+import { derivePhoenixWebConsoleSurfacePosture, startPhoenixWebConsole } from "./web-console.js";
 import { buildPhoenixWebSnapshot } from "./web-contract.js";
 
 function parsePositiveInteger(value: string, label: string): number {
@@ -282,7 +282,14 @@ async function main() {
           timelineLimit: options.timelineLimit,
         }),
       });
+      const posture = derivePhoenixWebConsoleSurfacePosture({ bindHost: options.host, defaultToLoopbackRequest: true });
       console.log(`Phoenix web console listening at ${server.url}`);
+      if (posture.bindingMode === "network-exposed") {
+        console.log("Warning: this bind reaches beyond loopback. Phoenix Web v1 is not a remote admin panel.");
+        console.log("Manual browser actions still require a same-machine loopback session; use the Phoenix host's own browser for backup-now and health-check-now.");
+      } else {
+        console.log("Manual browser actions stay loopback-local and require same-origin requests from the Phoenix console itself.");
+      }
       console.log("Press Ctrl+C to stop.");
       let shuttingDown = false;
       const shutdown = async (signal: string) => {

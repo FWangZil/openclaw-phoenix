@@ -2,7 +2,7 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { recordPhoenixRecoveryAction, buildPhoenixWebSnapshot } from "./web-contract.js";
+import { buildPhoenixWebSnapshot, recordPhoenixHealthCheckAction, recordPhoenixRecoveryAction } from "./web-contract.js";
 
 const tempDirs: string[] = [];
 
@@ -94,5 +94,83 @@ describe("buildPhoenixWebSnapshot setup", () => {
     ]));
     expect(snapshot.setup.commands[1]?.command).toContain("--self-heal");
     expect(snapshot.setup.commands[1]?.command).toContain("--notify-target alerts-room");
+  });
+
+  it("builds run-centric continuity metadata and retains durable web-action audit history", async () => {
+    const homeDir = await makeTempDir("phoenix-web-history-");
+    const stateDir = path.join(homeDir, ".openclaw");
+    const configPath = path.join(stateDir, "openclaw.json");
+    const outputDir = path.join(homeDir, "archives");
+    const archivePath = path.join(outputDir, "2026-03-10T12-00-00.000Z-openclaw-backup.tar.gz");
+    await fs.mkdir(stateDir, { recursive: true });
+    await fs.mkdir(outputDir, { recursive: true });
+    await fs.writeFile(configPath, JSON.stringify({ runtime: "test" }), "utf8");
+    await fs.writeFile(archivePath, "archive", "utf8");
+
+    await recordPhoenixRecoveryAction({
+      origin: "hook",
+      configPath,
+      outputDir,
+      retain: 5,
+      selfHeal: true,
+      notification: {
+        enabled: true,
+        policy: "all",
+        target: { to: "alerts-room" },
+      },
+      startedAt: "2026-03-10T11:55:00.000Z",
+      finishedAt: "2026-03-10T11:56:00.000Z",
+      result: {
+        ok: true,
+        backup: { attempted: true, archivePath },
+        health: { healthy: true, reason: "gateway reachable" },
+        knownGood: { currentArchivePath: archivePath, promotedArchivePath: archivePath },
+        rollback: { needed: false, attempted: false, restored: false },
+        retention: { kept: [archivePath], deleted: [] },
+        notifications: [{ code: "healthy", severity: "info", message: "healthy" }],
+        notificationDelivery: { results: [{ attempted: true, delivered: true, event: { code: "healthy", severity: "info", message: "healthy" } }] },
+      },
+    });
+
+    await recordPhoenixHealthCheckAction({
+      origin: "manual",
+      trigger: { source: "web-console", request: "health-check-now" },
+      configPath,
+      outputDir,
+      startedAt: "2026-03-10T12:10:00.000Z",
+      finishedAt: "2026-03-10T12:11:00.000Z",
+      status: "warning",
+      health: { attempted: true, healthy: false, reason: "gateway unreachable" },
+    });
+
+    const snapshot = await buildPhoenixWebSnapshot({
+      configPath,
+      env: { ...process.env, HOME: homeDir },
+      outputDir,
+      timelineLimit: 5,
+    });
+
+    expect(snapshot.overview.latestWebAction?.result).toMatchObject({
+      trigger: { source: "web-console", request: "health-check-now" },
+      operation: "health-check",
+      status: "warning",
+    });
+    expect(snapshot.timeline.runs[0]).toMatchObject({
+      actionId: snapshot.overview.latestAction?.id,
+      roles: ["latest-action", "latest-web", "latest-health"],
+      trigger: { source: "web-console", request: "health-check-now" },
+      stages: expect.arrayContaining([
+        expect.objectContaining({ type: "health", status: "warning", detail: expect.stringContaining("gateway unreachable") }),
+      ]),
+    });
+    expect(snapshot.timeline.runs[1]).toMatchObject({
+      trigger: { source: "hook" },
+      roles: expect.arrayContaining(["latest-backup", "latest-notification"]),
+      stages: expect.arrayContaining([
+        expect.objectContaining({ type: "backup", status: "ok" }),
+        expect.objectContaining({ type: "known-good", status: "ok" }),
+        expect.objectContaining({ type: "notification", status: "ok" }),
+      ]),
+    });
   });
 });

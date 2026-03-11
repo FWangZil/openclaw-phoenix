@@ -28,6 +28,13 @@ export type PhoenixWebOrigin = "watch" | "hook" | "manual";
 export type PhoenixWebOperation = "backup-cycle" | "recovery-cycle" | "restore" | "health-check";
 export type PhoenixWebActionStatus = "ok" | "warning" | "error";
 export type PhoenixWebNotificationMode = "off" | "exceptional-only" | "all";
+export type PhoenixWebActionTriggerSource = "watch" | "hook" | "cli" | "web-console";
+export type PhoenixWebActionTriggerRequest = "backup-now" | "health-check-now";
+
+export type PhoenixWebActionTrigger = {
+  source: PhoenixWebActionTriggerSource;
+  request?: PhoenixWebActionTriggerRequest;
+};
 
 export type PhoenixWebNotificationConfigSummary = {
   enabled: boolean;
@@ -100,6 +107,7 @@ export type PhoenixActionResult = {
   origin: PhoenixWebOrigin;
   operation: PhoenixWebOperation;
   status: PhoenixWebActionStatus;
+  trigger?: PhoenixWebActionTrigger;
   startedAt: string;
   finishedAt: string;
   summary: string;
@@ -133,11 +141,43 @@ type PhoenixByOrigin<T> = {
   manual?: T;
 };
 
+export type PhoenixTimelineRunRole =
+  | "latest-action"
+  | "latest-backup"
+  | "latest-health"
+  | "latest-rollback"
+  | "latest-notification"
+  | "latest-restore"
+  | "latest-web";
+
+export type PhoenixTimelineRunStageType = "backup" | "health" | "known-good" | "rollback" | "notification" | "restore" | "retention";
+export type PhoenixTimelineRunStageStatus = "ok" | "warning" | "error" | "neutral";
+
+export type PhoenixTimelineRunStage = {
+  type: PhoenixTimelineRunStageType;
+  status: PhoenixTimelineRunStageStatus;
+  detail: string;
+};
+
+export type PhoenixTimelineRunSummary = {
+  actionId: string;
+  origin: PhoenixWebOrigin;
+  operation: PhoenixWebOperation;
+  status: PhoenixWebActionStatus;
+  trigger: PhoenixWebActionTrigger;
+  startedAt: string;
+  finishedAt: string;
+  summary: string;
+  roles: PhoenixTimelineRunRole[];
+  stages: PhoenixTimelineRunStage[];
+};
+
 export type PhoenixOverviewReadModel = {
   schemaVersion: 1;
   generatedAt: string;
   latestAction?: PhoenixActionResult;
   latestByOrigin: PhoenixByOrigin<PhoenixActionResult>;
+  latestWebAction?: PhoenixLatestResult<PhoenixActionResult>;
   latestBackup?: PhoenixLatestResult<PhoenixWebBackupResult>;
   latestHealth?: PhoenixLatestResult<PhoenixWebHealthResult>;
   latestRollback?: PhoenixLatestResult<PhoenixWebRollbackResult>;
@@ -152,6 +192,7 @@ export type PhoenixTimelineReadModel = {
   schemaVersion: 1;
   generatedAt: string;
   entries: PhoenixActionResult[];
+  runs: PhoenixTimelineRunSummary[];
 };
 
 export type PhoenixOriginConfigSummary = PhoenixWebRunConfig & {
@@ -328,6 +369,14 @@ function classifyBackupCycleStatus(backup: PhoenixWebBackupResult): PhoenixWebAc
   return backup.error ? "error" : "ok";
 }
 
+function defaultTriggerForOrigin(origin: PhoenixWebOrigin): PhoenixWebActionTrigger {
+  return origin === "watch" ? { source: "watch" } : origin === "hook" ? { source: "hook" } : { source: "cli" };
+}
+
+function resolveActionTrigger(action: Pick<PhoenixActionResult, "origin" | "trigger">): PhoenixWebActionTrigger {
+  return action.trigger ?? defaultTriggerForOrigin(action.origin);
+}
+
 function toOriginLabel(origin: PhoenixWebOrigin): string {
   return origin === "hook" ? "Hook" : origin === "watch" ? "Watch" : "Manual";
 }
@@ -421,6 +470,7 @@ async function appendPhoenixAction(outputDir: string, action: PhoenixActionResul
 
 export async function recordPhoenixRecoveryAction(options: {
   origin: PhoenixWebOrigin;
+  trigger?: PhoenixWebActionTrigger;
   configPath?: string;
   outputDir: string;
   retain: number;
@@ -461,6 +511,7 @@ export async function recordPhoenixRecoveryAction(options: {
       rollback: options.result.rollback,
       notification,
     }),
+    trigger: options.trigger ?? defaultTriggerForOrigin(options.origin),
     startedAt: options.startedAt,
     finishedAt: options.finishedAt,
     summary: summarizeRecoveryAction({
@@ -510,6 +561,7 @@ export async function recordPhoenixBackupWatchAction(options: {
 
 export async function recordPhoenixBackupAction(options: {
   origin?: PhoenixWebOrigin;
+  trigger?: PhoenixWebActionTrigger;
   configPath?: string;
   outputDir: string;
   retain: number;
@@ -525,6 +577,7 @@ export async function recordPhoenixBackupAction(options: {
     origin,
     operation: "backup-cycle",
     status: classifyBackupCycleStatus(options.backup),
+    trigger: options.trigger ?? defaultTriggerForOrigin(origin),
     startedAt: options.startedAt,
     finishedAt: options.finishedAt,
     summary: summarizeBackupAction({
@@ -547,6 +600,7 @@ export async function recordPhoenixBackupAction(options: {
 
 export async function recordPhoenixHealthCheckAction(options: {
   origin?: PhoenixWebOrigin;
+  trigger?: PhoenixWebActionTrigger;
   configPath?: string;
   outputDir: string;
   startedAt: string;
@@ -561,6 +615,7 @@ export async function recordPhoenixHealthCheckAction(options: {
     origin,
     operation: "health-check",
     status: options.status,
+    trigger: options.trigger ?? defaultTriggerForOrigin(origin),
     startedAt: options.startedAt,
     finishedAt: options.finishedAt,
     summary: summarizeHealthCheckAction({
@@ -580,6 +635,7 @@ export async function recordPhoenixHealthCheckAction(options: {
 
 export async function recordPhoenixRestoreAction(options: {
   origin?: PhoenixWebOrigin;
+  trigger?: PhoenixWebActionTrigger;
   configPath?: string;
   outputDir: string;
   dryRun: boolean;
@@ -614,6 +670,7 @@ export async function recordPhoenixRestoreAction(options: {
     origin: options.origin ?? "manual",
     operation: "restore",
     status: options.error ? "error" : "ok",
+    trigger: options.trigger ?? defaultTriggerForOrigin(options.origin ?? "manual"),
     startedAt: options.startedAt,
     finishedAt: options.finishedAt,
     summary: summarizeRestoreAction({
@@ -658,6 +715,154 @@ function findLatestResult<T>(
     }
   }
   return undefined;
+}
+
+function addRunRole(map: Map<string, Set<PhoenixTimelineRunRole>>, actionId: string | undefined, role: PhoenixTimelineRunRole) {
+  if (!actionId) {
+    return;
+  }
+  const roles = map.get(actionId) ?? new Set<PhoenixTimelineRunRole>();
+  roles.add(role);
+  map.set(actionId, roles);
+}
+
+const TIMELINE_RUN_ROLE_ORDER: PhoenixTimelineRunRole[] = [
+  "latest-action",
+  "latest-web",
+  "latest-backup",
+  "latest-health",
+  "latest-rollback",
+  "latest-notification",
+  "latest-restore",
+];
+
+function buildTimelineRunStages(entry: PhoenixActionResult): PhoenixTimelineRunStage[] {
+  const stages: PhoenixTimelineRunStage[] = [];
+  if (entry.backup?.attempted) {
+    stages.push(entry.backup.error
+      ? { type: "backup", status: "error", detail: `Backup failed: ${entry.backup.error}` }
+      : { type: "backup", status: "ok", detail: `Backup wrote ${path.basename(entry.backup.archivePath ?? "archive")}` });
+  }
+  if (entry.health?.attempted) {
+    stages.push({
+      type: "health",
+      status: entry.health.healthy ? "ok" : entry.status === "error" ? "error" : "warning",
+      detail: `${entry.health.healthy ? "Health stayed healthy" : "Health turned unhealthy"}${entry.health.reason ? ` (${entry.health.reason})` : ""}`,
+    });
+  }
+  if (entry.knownGood?.promotedArchivePath) {
+    stages.push({
+      type: "known-good",
+      status: "ok",
+      detail: `Known-good promoted to ${path.basename(entry.knownGood.promotedArchivePath)}`,
+    });
+  } else if (entry.knownGood?.currentArchivePath) {
+    stages.push({
+      type: "known-good",
+      status: "neutral",
+      detail: `Current known-good remains ${path.basename(entry.knownGood.currentArchivePath)}`,
+    });
+  }
+  if (entry.rollback) {
+    stages.push(entry.rollback.restored
+      ? {
+          type: "rollback",
+          status: "warning",
+          detail: `Rollback restored ${path.basename(entry.rollback.archivePath ?? "archive")}`,
+        }
+      : entry.rollback.needed && entry.rollback.attempted
+        ? {
+            type: "rollback",
+            status: "error",
+            detail: `Rollback failed${entry.rollback.error ? `: ${entry.rollback.error}` : ""}`,
+          }
+        : entry.rollback.needed
+          ? {
+              type: "rollback",
+              status: "error",
+              detail: "Rollback needed a known-good archive, but none was available",
+            }
+          : {
+              type: "rollback",
+              status: "ok",
+              detail: "Rollback was not needed for this run",
+            });
+  }
+  if (entry.notification) {
+    const deliveryCount = entry.notification.delivery.length;
+    const firstDeliveryError = entry.notification.delivery.find((result) => !result.delivered)?.error;
+    stages.push(entry.notification.status === "delivered"
+      ? {
+          type: "notification",
+          status: "ok",
+          detail: `Notification delivered (${deliveryCount} attempt${deliveryCount === 1 ? "" : "s"})`,
+        }
+      : entry.notification.status === "failed"
+        ? {
+            type: "notification",
+            status: "warning",
+            detail: `Notification delivery failed${firstDeliveryError ? `: ${firstDeliveryError}` : ""}`,
+          }
+        : entry.notification.status === "not-configured"
+          ? {
+              type: "notification",
+              status: "warning",
+              detail: "Notification was skipped because no target was configured",
+            }
+          : entry.notification.status === "suppressed"
+            ? {
+                type: "notification",
+                status: "warning",
+                detail: "Notification was suppressed by the run policy",
+              }
+            : {
+                type: "notification",
+                status: "neutral",
+                detail: "Notification was idle for this run",
+              });
+  }
+  if (entry.restore) {
+    stages.push(entry.restore.error
+      ? {
+          type: "restore",
+          status: "error",
+          detail: `Restore failed for ${path.basename(entry.restore.archivePath)}: ${entry.restore.error}`,
+        }
+      : entry.restore.dryRun
+        ? {
+            type: "restore",
+            status: "neutral",
+            detail: `Restore dry-run verified ${path.basename(entry.restore.archivePath)}`,
+          }
+        : {
+            type: "restore",
+            status: "ok",
+            detail: `Restore applied ${path.basename(entry.restore.archivePath)} to ${entry.restore.restoredPaths.length} path(s)`,
+          });
+  }
+  if (entry.retention) {
+    stages.push({
+      type: "retention",
+      status: entry.retention.deleted.length > 0 ? "warning" : "neutral",
+      detail: `Retention kept ${entry.retention.kept.length} archive(s) and pruned ${entry.retention.deleted.length}`,
+    });
+  }
+  return stages;
+}
+
+function buildTimelineRuns(entries: PhoenixActionResult[], roleMap: Map<string, Set<PhoenixTimelineRunRole>>): PhoenixTimelineRunSummary[] {
+  return entries.map((entry) => ({
+    actionId: entry.id,
+    origin: entry.origin,
+    operation: entry.operation,
+    status: entry.status,
+    trigger: resolveActionTrigger(entry),
+    startedAt: entry.startedAt,
+    finishedAt: entry.finishedAt,
+    summary: entry.summary,
+    roles: TIMELINE_RUN_ROLE_ORDER.filter((role) => roleMap.get(entry.id)?.has(role) ?? false),
+    stages: buildTimelineRunStages(entry),
+  }));
 }
 
 async function summarizeArchives(outputDir: string, latestKnownGoodArchivePath?: string, lastBackupArchivePath?: string) {
@@ -1191,7 +1396,12 @@ export async function buildPhoenixWebSnapshot(options: {
     readPhoenixWebState(options.outputDir),
     readPhoenixRecoveryState(options.outputDir),
   ]);
+  const latestAction = webState.history[0];
   const latestByOrigin = findLatestByOrigin(webState.history);
+  const latestWebAction = findLatestResult(
+    webState.history,
+    (entry) => resolveActionTrigger(entry).source === "web-console" ? entry : undefined,
+  );
   const deployment = await resolveDeploymentSummary({
     configPath: options.configPath,
     env: options.env,
@@ -1215,18 +1425,33 @@ export async function buildPhoenixWebSnapshot(options: {
     }),
     manual: originSummaryFromAction(latestByOrigin.manual),
   } satisfies PhoenixConfigSummaryReadModel["origins"];
+  const latestBackup = findLatestResult(webState.history, (entry) => entry.backup);
+  const latestHealth = findLatestResult(webState.history, (entry) => entry.health);
+  const latestRollback = findLatestResult(webState.history, (entry) => entry.rollback);
+  const latestNotification = findLatestResult(webState.history, (entry) => entry.notification);
+  const latestRestore = findLatestResult(webState.history, (entry) => entry.restore);
+  const timelineEntries = webState.history.slice(0, options.timelineLimit ?? 20);
+  const roleMap = new Map<string, Set<PhoenixTimelineRunRole>>();
+  addRunRole(roleMap, latestAction?.id, "latest-action");
+  addRunRole(roleMap, latestWebAction?.operationId, "latest-web");
+  addRunRole(roleMap, latestBackup?.operationId, "latest-backup");
+  addRunRole(roleMap, latestHealth?.operationId, "latest-health");
+  addRunRole(roleMap, latestRollback?.operationId, "latest-rollback");
+  addRunRole(roleMap, latestNotification?.operationId, "latest-notification");
+  addRunRole(roleMap, latestRestore?.operationId, "latest-restore");
   return {
     schemaVersion: PHOENIX_WEB_SCHEMA_VERSION,
     overview: {
       schemaVersion: PHOENIX_WEB_SCHEMA_VERSION,
       generatedAt,
-      latestAction: webState.history[0],
+      latestAction,
       latestByOrigin,
-      latestBackup: findLatestResult(webState.history, (entry) => entry.backup),
-      latestHealth: findLatestResult(webState.history, (entry) => entry.health),
-      latestRollback: findLatestResult(webState.history, (entry) => entry.rollback),
-      latestNotification: findLatestResult(webState.history, (entry) => entry.notification),
-      latestRestore: findLatestResult(webState.history, (entry) => entry.restore),
+      latestWebAction,
+      latestBackup,
+      latestHealth,
+      latestRollback,
+      latestNotification,
+      latestRestore,
       latestKnownGoodArchivePath: recoveryState.latestKnownGoodArchivePath,
       lastBackupArchivePath: recoveryState.lastBackupArchivePath,
       archiveCount: archives.length,
@@ -1234,7 +1459,8 @@ export async function buildPhoenixWebSnapshot(options: {
     timeline: {
       schemaVersion: PHOENIX_WEB_SCHEMA_VERSION,
       generatedAt,
-      entries: webState.history.slice(0, options.timelineLimit ?? 20),
+      entries: timelineEntries,
+      runs: buildTimelineRuns(timelineEntries, roleMap),
     },
     config: {
       schemaVersion: PHOENIX_WEB_SCHEMA_VERSION,

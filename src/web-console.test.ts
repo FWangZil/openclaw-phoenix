@@ -1,5 +1,8 @@
 import { afterEach, describe, expect, it } from "vitest";
 import {
+  derivePhoenixWebConsoleSurfacePosture,
+  evaluatePhoenixWebManualActionRequest,
+  PHOENIX_WEB_MANUAL_ACTION_HEADER,
   renderPhoenixWebConsoleErrorPage,
   renderPhoenixWebConsolePage,
   startPhoenixWebConsole,
@@ -24,6 +27,7 @@ function buildSnapshot(overrides: Partial<PhoenixWebSnapshot> = {}): PhoenixWebS
       schemaVersion: 1,
       generatedAt: "2026-03-10T12:00:00.000Z",
       entries: [],
+      runs: [],
       ...overrides.timeline,
     },
     config: {
@@ -74,6 +78,7 @@ describe("renderPhoenixWebConsolePage", () => {
     expect(overviewHtml).toContain("Data freshness");
     expect(overviewHtml).toContain("Browser checks for newer data every 15 second(s)");
     expect(overviewHtml).toContain("Refresh now");
+    expect(overviewHtml).toContain("Web surface boundary");
     expect(overviewHtml).toContain("Manual browser actions");
     expect(overviewHtml).toContain("Run backup now");
     expect(overviewHtml).toContain("Run health check now");
@@ -182,6 +187,140 @@ describe("renderPhoenixWebConsolePage", () => {
     expect(html).toContain("Installed (self-heal)");
     expect(html).toContain("gateway unreachable");
     expect(html).toContain("Latest known-good");
+  });
+
+  it("renders run-centric activity summaries with durable web-action attribution", () => {
+    const manualBackup = {
+      schemaVersion: 1 as const,
+      id: "web-1",
+      origin: "manual" as const,
+      operation: "backup-cycle" as const,
+      status: "ok" as const,
+      trigger: { source: "web-console" as const, request: "backup-now" as const },
+      startedAt: "2026-03-10T12:19:00.000Z",
+      finishedAt: "2026-03-10T12:20:00.000Z",
+      summary: "Manual backup created manual-web.tar.gz.",
+      config: {
+        outputDir: "/tmp/phoenix",
+        retain: 2,
+        notification: { enabled: false, policy: "off" as const, targetConfigured: false },
+      },
+      backup: { attempted: true, archivePath: "/tmp/phoenix/manual-web.tar.gz" },
+      retention: { kept: ["/tmp/phoenix/manual-web.tar.gz"], deleted: ["/tmp/phoenix/old.tar.gz"] },
+    };
+    const hookRecovery = {
+      schemaVersion: 1 as const,
+      id: "hook-1",
+      origin: "hook" as const,
+      operation: "recovery-cycle" as const,
+      status: "ok" as const,
+      trigger: { source: "hook" as const },
+      startedAt: "2026-03-10T12:00:00.000Z",
+      finishedAt: "2026-03-10T12:02:00.000Z",
+      summary: "Hook recovery promoted known-good.tar.gz as latest known-good.",
+      config: {
+        outputDir: "/tmp/phoenix",
+        retain: 5,
+        selfHeal: true,
+        notification: { enabled: true, policy: "all" as const, targetConfigured: true },
+      },
+      backup: { attempted: true, archivePath: "/tmp/phoenix/known-good.tar.gz" },
+      health: { attempted: true, healthy: true, reason: "gateway reachable" },
+      knownGood: { currentArchivePath: "/tmp/phoenix/known-good.tar.gz", promotedArchivePath: "/tmp/phoenix/known-good.tar.gz" },
+      rollback: { needed: false, attempted: false, restored: false },
+      notification: { status: "delivered" as const, events: [], delivery: [] },
+      retention: { kept: ["/tmp/phoenix/known-good.tar.gz"], deleted: [] },
+    };
+    const snapshot = buildSnapshot({
+      overview: {
+        schemaVersion: 1,
+        generatedAt: "2026-03-10T12:21:00.000Z",
+        latestAction: manualBackup,
+        latestByOrigin: { hook: hookRecovery, manual: manualBackup },
+        latestWebAction: {
+          operationId: "web-1",
+          origin: "manual",
+          finishedAt: "2026-03-10T12:20:00.000Z",
+          actionStatus: "ok",
+          result: manualBackup,
+        },
+        latestBackup: {
+          operationId: "web-1",
+          origin: "manual",
+          finishedAt: "2026-03-10T12:20:00.000Z",
+          actionStatus: "ok",
+          result: { attempted: true, archivePath: "/tmp/phoenix/manual-web.tar.gz" },
+        },
+        latestHealth: {
+          operationId: "hook-1",
+          origin: "hook",
+          finishedAt: "2026-03-10T12:02:00.000Z",
+          actionStatus: "ok",
+          result: { attempted: true, healthy: true, reason: "gateway reachable" },
+        },
+        archiveCount: 2,
+      },
+      timeline: {
+        schemaVersion: 1,
+        generatedAt: "2026-03-10T12:21:00.000Z",
+        entries: [manualBackup, hookRecovery],
+        runs: [
+          {
+            actionId: "web-1",
+            origin: "manual",
+            operation: "backup-cycle",
+            status: "ok",
+            trigger: { source: "web-console" as const, request: "backup-now" as const },
+            startedAt: "2026-03-10T12:19:00.000Z",
+            finishedAt: "2026-03-10T12:20:00.000Z",
+            summary: manualBackup.summary,
+            roles: ["latest-action", "latest-web", "latest-backup"],
+            stages: [
+              { type: "backup", status: "ok", detail: "Backup wrote manual-web.tar.gz" },
+              { type: "retention", status: "warning", detail: "Retention kept 1 archive(s) and pruned 1" },
+            ],
+          },
+          {
+            actionId: "hook-1",
+            origin: "hook",
+            operation: "recovery-cycle",
+            status: "ok",
+            trigger: { source: "hook" as const },
+            startedAt: "2026-03-10T12:00:00.000Z",
+            finishedAt: "2026-03-10T12:02:00.000Z",
+            summary: hookRecovery.summary,
+            roles: ["latest-health"],
+            stages: [
+              { type: "backup", status: "ok", detail: "Backup wrote known-good.tar.gz" },
+              { type: "health", status: "ok", detail: "Health stayed healthy (gateway reachable)" },
+              { type: "known-good", status: "ok", detail: "Known-good promoted to known-good.tar.gz" },
+            ],
+          },
+        ],
+      },
+    });
+
+    const html = renderPhoenixWebConsolePage(snapshot, "activity");
+
+    expect(html).toContain("Run continuity");
+    expect(html).toContain("Latest web-triggered run");
+    expect(html).toContain("Latest by origin");
+    expect(html).toContain("Web action • Backup now");
+    expect(html).toContain("Latest web");
+    expect(html).toContain("Known-good promoted to known-good.tar.gz");
+  });
+
+  it("renders network-exposed posture as read-only visibility plus loopback-only mutations", () => {
+    const snapshot = buildSnapshot();
+    const posture = derivePhoenixWebConsoleSurfacePosture({ bindHost: "0.0.0.0", remoteAddress: "192.168.1.10" });
+
+    const html = renderPhoenixWebConsolePage(snapshot, "overview", undefined, posture);
+
+    expect(html).toContain("Reachable beyond loopback (0.0.0.0)");
+    expect(html).toContain("Remote request");
+    expect(html).toContain("not intended for remote administration");
+    expect(html).toContain('data-manual-action="backup-now" disabled');
+    expect(html).toContain("POST /api/actions/backup-now");
   });
 
   it("explains limited backup-only coverage and aging snapshots", () => {
@@ -366,6 +505,40 @@ describe("startPhoenixWebConsole", () => {
     expect(renderPhoenixWebConsoleErrorPage({ error: new Error("boom"), pathname: "/overview", view: "overview" })).toContain("Overview unavailable");
   });
 
+  it("rejects direct action posts that skip the guarded browser mutation contract", async () => {
+    const actionController: PhoenixWebActionController = {
+      getState: () => ({}),
+      start: async () => ({ ok: true, state: {} }),
+    };
+    const server = await startPhoenixWebConsole({
+      host: "127.0.0.1",
+      port: 0,
+      actionController,
+      loadSnapshot: async () => buildSnapshot(),
+    });
+    servers.push(server);
+
+    const missingHeader = await fetch(`${server.url}/api/actions/backup-now`, { method: "POST" });
+    const badOrigin = await fetch(`${server.url}/api/actions/health-check-now`, {
+      method: "POST",
+      headers: {
+        origin: "http://evil.example",
+        [PHOENIX_WEB_MANUAL_ACTION_HEADER]: "health-check-now",
+      },
+    });
+
+    expect(missingHeader.status).toBe(403);
+    expect(await missingHeader.json()).toMatchObject({
+      ok: false,
+      error: expect.stringContaining(PHOENIX_WEB_MANUAL_ACTION_HEADER),
+    });
+    expect(badOrigin.status).toBe(403);
+    expect(await badOrigin.json()).toMatchObject({
+      ok: false,
+      error: expect.stringContaining("Origin mismatch"),
+    });
+  });
+
   it("starts manual browser actions through the narrow action API", async () => {
     let state: PhoenixWebActionState = {};
     const actionController: PhoenixWebActionController = {
@@ -390,7 +563,13 @@ describe("startPhoenixWebConsole", () => {
     servers.push(server);
 
     const overview = await fetch(`${server.url}/overview`);
-    const startAction = await fetch(`${server.url}/api/actions/backup-now`, { method: "POST" });
+    const startAction = await fetch(`${server.url}/api/actions/backup-now`, {
+      method: "POST",
+      headers: {
+        origin: server.url,
+        [PHOENIX_WEB_MANUAL_ACTION_HEADER]: "backup-now",
+      },
+    });
     const actionState = await fetch(`${server.url}/api/actions/state`);
 
     expect(overview.status).toBe(200);
@@ -404,5 +583,42 @@ describe("startPhoenixWebConsole", () => {
     expect(await actionState.json()).toMatchObject({
       running: { action: "backup-now" },
     });
+  });
+
+  it("classifies manual action requests by loopback, header, and origin posture", () => {
+    const remote = evaluatePhoenixWebManualActionRequest({
+      action: "backup-now",
+      bindHost: "0.0.0.0",
+      method: "POST",
+      remoteAddress: "192.168.1.44",
+      requestHost: "phoenix.local:48789",
+      requestHeader: "backup-now",
+    });
+    const missingHeader = evaluatePhoenixWebManualActionRequest({
+      action: "backup-now",
+      bindHost: "127.0.0.1",
+      method: "POST",
+      remoteAddress: "::ffff:127.0.0.1",
+      requestHost: "127.0.0.1:48789",
+    });
+    const badOrigin = evaluatePhoenixWebManualActionRequest({
+      action: "health-check-now",
+      bindHost: "127.0.0.1",
+      method: "POST",
+      remoteAddress: "127.0.0.1",
+      requestHost: "127.0.0.1:48789",
+      origin: "http://evil.example",
+      requestHeader: "health-check-now",
+    });
+
+    expect(remote).toMatchObject({ ok: false, status: 403 });
+    if (remote.ok || missingHeader.ok || badOrigin.ok) {
+      throw new Error("expected manual action requests to be rejected");
+    }
+    expect(remote.error).toContain("same machine over loopback");
+    expect(missingHeader).toMatchObject({ ok: false, status: 403 });
+    expect(missingHeader.error).toContain(PHOENIX_WEB_MANUAL_ACTION_HEADER);
+    expect(badOrigin).toMatchObject({ ok: false, status: 403 });
+    expect(badOrigin.error).toContain("Origin mismatch");
   });
 });

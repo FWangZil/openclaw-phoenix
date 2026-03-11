@@ -5,9 +5,11 @@ import type {
   PhoenixActionResult,
   PhoenixArchiveSummaryItem,
   PhoenixConfigSummaryReadModel,
+  PhoenixTimelineRunStage,
+  PhoenixTimelineRunSummary,
   PhoenixSetupItem,
   PhoenixSetupReadiness,
-  PhoenixTimelineReadModel,
+  PhoenixWebActionTrigger,
   PhoenixWebNotificationResult,
   PhoenixWebSnapshot,
 } from "./web-contract.js";
@@ -28,6 +30,18 @@ export type StartPhoenixWebConsoleOptions = {
   loadSnapshot: () => Promise<PhoenixWebSnapshot>;
 };
 
+export type PhoenixWebConsoleBindingMode = "loopback-only" | "network-exposed";
+export type PhoenixWebConsoleRequestSource = "loopback" | "remote" | "unknown";
+export type PhoenixWebConsoleSurfacePosture = {
+  bindHost: string;
+  bindingMode: PhoenixWebConsoleBindingMode;
+  requestSource: PhoenixWebConsoleRequestSource;
+  remoteAddress?: string;
+  manualActionsAvailable: boolean;
+  manualActionsDetail: string;
+  mutationGuardSummary: string;
+};
+
 type Tone = "ok" | "warning" | "error" | "empty";
 type KeyValueRow = { label: string; value?: string; tone?: Tone };
 type LatestResult<T> = { origin: string; finishedAt: string; actionStatus: string; result: T };
@@ -38,6 +52,9 @@ type ExplanationCard = { tone: Tone; eyebrow: string; detail: string; rows: KeyV
 const SNAPSHOT_POLL_INTERVAL_MS = 15_000;
 const SNAPSHOT_STALE_AFTER_MS = 45_000;
 const ACTION_OUTCOME_OLD_AFTER_MS = 10 * 60_000;
+export const PHOENIX_WEB_MANUAL_ACTION_HEADER = "x-phoenix-manual-action";
+const PHOENIX_WEB_MUTATION_GUARD_SUMMARY =
+  `POST + ${PHOENIX_WEB_MANUAL_ACTION_HEADER} + loopback requester + same-origin Origin/Sec-Fetch-Site checks when present`;
 
 const VIEW_TITLES: Record<PhoenixConsoleView, string> = {
   overview: "Overview",
@@ -46,6 +63,150 @@ const VIEW_TITLES: Record<PhoenixConsoleView, string> = {
   archives: "Archives",
   configuration: "Configuration",
 };
+
+function readHeaderValue(value: string | string[] | undefined): string | undefined {
+  return Array.isArray(value) ? value[0] : value;
+}
+
+function toHttpUrl(value: string): string {
+  if (value.includes("://")) {
+    return value;
+  }
+  const trimmed = value.trim();
+  if (trimmed.includes(":") && !trimmed.startsWith("[") && trimmed.split(":").length > 2) {
+    return `http://[${trimmed}]`;
+  }
+  return `http://${trimmed}`;
+}
+
+function normalizeHostName(value: string): string {
+  try {
+    return new URL(toHttpUrl(value)).hostname.toLowerCase();
+  } catch {
+    return value.replace(/^\[/u, "").replace(/\]$/u, "").toLowerCase();
+  }
+}
+
+function isLoopbackHost(value: string): boolean {
+  const normalized = normalizeHostName(value);
+  return normalized === "127.0.0.1" || normalized === "::1" || normalized === "localhost";
+}
+
+function isLoopbackRemoteAddress(value: string | undefined): boolean {
+  return value === "127.0.0.1" || value === "::1" || value === "::ffff:127.0.0.1";
+}
+
+function originForRequestHost(value: string | undefined): string | undefined {
+  if (!value) {
+    return undefined;
+  }
+  try {
+    return new URL(toHttpUrl(value)).origin;
+  } catch {
+    return undefined;
+  }
+}
+
+export function derivePhoenixWebConsoleSurfacePosture(options: {
+  bindHost?: string;
+  remoteAddress?: string;
+  defaultToLoopbackRequest?: boolean;
+} = {}): PhoenixWebConsoleSurfacePosture {
+  const bindHost = options.bindHost ?? "127.0.0.1";
+  const bindingMode: PhoenixWebConsoleBindingMode = isLoopbackHost(bindHost) ? "loopback-only" : "network-exposed";
+  const requestSource: PhoenixWebConsoleRequestSource = options.remoteAddress
+    ? isLoopbackRemoteAddress(options.remoteAddress)
+      ? "loopback"
+      : "remote"
+    : options.defaultToLoopbackRequest
+      ? "loopback"
+      : "unknown";
+  const manualActionsAvailable = requestSource === "loopback";
+  const manualActionsDetail = requestSource === "loopback"
+    ? bindingMode === "loopback-only"
+      ? "Manual browser actions are available from this same-machine loopback session. Phoenix still keeps the browser surface limited to backup now and health check now."
+      : "Manual browser actions are available because this request came from loopback on the Phoenix host. Even on a wider bind, Phoenix does not treat this as a remote admin panel."
+    : requestSource === "remote"
+      ? "Manual browser actions are disabled for this request. Phoenix only permits them from the same machine over loopback, so this browser surface is not intended for remote administration."
+      : "Phoenix could not confirm that this request came from loopback, so manual browser actions stay unavailable until the console is opened locally on the Phoenix host.";
+  return {
+    bindHost,
+    bindingMode,
+    requestSource,
+    remoteAddress: options.remoteAddress,
+    manualActionsAvailable,
+    manualActionsDetail,
+    mutationGuardSummary: PHOENIX_WEB_MUTATION_GUARD_SUMMARY,
+  };
+}
+
+export function evaluatePhoenixWebManualActionRequest(options: {
+  action: PhoenixWebManualAction;
+  bindHost?: string;
+  method?: string;
+  remoteAddress?: string;
+  requestHost?: string;
+  origin?: string;
+  secFetchSite?: string;
+  requestHeader?: string;
+}):
+  | { ok: true; posture: PhoenixWebConsoleSurfacePosture }
+  | { ok: false; status: number; error: string; posture: PhoenixWebConsoleSurfacePosture } {
+  const posture = derivePhoenixWebConsoleSurfacePosture({ bindHost: options.bindHost, remoteAddress: options.remoteAddress });
+  if (options.method !== "POST") {
+    return { ok: false, status: 405, error: "Method Not Allowed", posture };
+  }
+  if (!posture.manualActionsAvailable) {
+    return { ok: false, status: 403, error: posture.manualActionsDetail, posture };
+  }
+  if (options.requestHeader !== options.action) {
+    return {
+      ok: false,
+      status: 403,
+      error: `Manual browser actions require the Phoenix console request header (${PHOENIX_WEB_MANUAL_ACTION_HEADER}: ${options.action}).`,
+      posture,
+    };
+  }
+  if (options.secFetchSite && options.secFetchSite !== "same-origin" && options.secFetchSite !== "same-site" && options.secFetchSite !== "none") {
+    return {
+      ok: false,
+      status: 403,
+      error: "Cross-site browser requests cannot trigger Phoenix manual actions.",
+      posture,
+    };
+  }
+  if (options.origin) {
+    const expectedOrigin = originForRequestHost(options.requestHost);
+    if (!expectedOrigin) {
+      return {
+        ok: false,
+        status: 403,
+        error: "Phoenix could not validate the request origin for this manual action.",
+        posture,
+      };
+    }
+    let actualOrigin: string;
+    try {
+      actualOrigin = new URL(options.origin).origin;
+    } catch {
+      return {
+        ok: false,
+        status: 403,
+        error: "Phoenix rejected an invalid Origin header for this manual action.",
+        posture,
+      };
+    }
+    if (actualOrigin !== expectedOrigin) {
+      return {
+        ok: false,
+        status: 403,
+        error: `Origin mismatch. Phoenix only accepts same-origin manual action requests from ${expectedOrigin}.`,
+        posture,
+      };
+    }
+  }
+  return { ok: true, posture };
+}
 
 function escapeHtml(value: unknown): string {
   return String(value)
@@ -131,6 +292,60 @@ function operationLabel(operation: PhoenixActionResult["operation"]): string {
 
 function manualActionLabel(action: PhoenixWebManualAction): string {
   return action === "backup-now" ? "Backup now" : "Health check now";
+}
+
+function triggerLabel(trigger: PhoenixWebActionTrigger): string {
+  return trigger.source === "web-console"
+    ? trigger.request ? `Web action • ${manualActionLabel(trigger.request)}` : "Web action"
+    : trigger.source === "cli"
+      ? "CLI"
+      : trigger.source === "hook"
+        ? "Hook"
+        : "Watch";
+}
+
+function triggerTone(trigger: PhoenixWebActionTrigger): Tone {
+  return trigger.source === "web-console" ? "warning" : trigger.source === "cli" ? "empty" : "ok";
+}
+
+function runRoleLabel(role: PhoenixTimelineRunSummary["roles"][number]): string {
+  return role === "latest-action"
+    ? "Latest meaningful"
+    : role === "latest-web"
+      ? "Latest web"
+      : role === "latest-backup"
+        ? "Latest backup"
+        : role === "latest-health"
+          ? "Latest health"
+          : role === "latest-rollback"
+            ? "Latest rollback"
+            : role === "latest-notification"
+              ? "Latest notification"
+              : "Latest restore";
+}
+
+function runRoleTone(role: PhoenixTimelineRunSummary["roles"][number]): Tone {
+  return role === "latest-action" || role === "latest-web" ? "warning" : "ok";
+}
+
+function runStageLabel(type: PhoenixTimelineRunStage["type"]): string {
+  return type === "known-good"
+    ? "Known-good"
+    : type === "health"
+      ? "Health"
+      : type === "notification"
+        ? "Notification"
+        : type === "rollback"
+          ? "Rollback"
+          : type === "retention"
+            ? "Retention"
+            : type === "restore"
+              ? "Restore"
+              : "Backup";
+}
+
+function toneForRunStageStatus(status: PhoenixTimelineRunStage["status"]): Tone {
+  return status === "error" ? "error" : status === "warning" ? "warning" : status === "ok" ? "ok" : "empty";
 }
 
 function protectionStateLabel(state: ProtectionStateLabel): string {
@@ -646,6 +861,94 @@ function renderLatestResultCard<T>(options: {
   );
 }
 
+function renderLatestWebActionCard(snapshot: PhoenixWebSnapshot): string {
+  const latest = snapshot.overview.latestWebAction;
+  if (!latest) {
+    return renderEmptyCard("Latest web-triggered run", "No browser-triggered Phoenix action has been recorded in durable history yet.");
+  }
+  const action = latest.result;
+  return renderCard(
+    "Latest web-triggered run",
+    `<p>${escapeHtml(action.summary)}</p><dl class="details-grid">${renderKeyValueList([
+      { label: "Action", value: escapeHtml(action.trigger?.request ? manualActionLabel(action.trigger.request) : "Browser action") },
+      { label: "Finished", value: escapeHtml(formatDateTime(action.finishedAt)) },
+      { label: "Outcome", value: statusBadge(action.status.toUpperCase(), toneForActionStatus(action.status)) },
+      { label: "Operation", value: `${originBadge(action.origin)}<span class="badge badge--muted">${escapeHtml(operationLabel(action.operation))}</span>` },
+      { label: "Run id", value: `<code>${escapeHtml(action.id)}</code>` },
+    ])}</dl>`,
+    { tone: toneForActionStatus(action.status), eyebrow: action.trigger?.request ? manualActionLabel(action.trigger.request) : "Web action" },
+  );
+}
+
+function renderRunContinuityCard(snapshot: PhoenixWebSnapshot): string {
+  const latestAction = snapshot.overview.latestAction;
+  if (!latestAction) {
+    return renderEmptyCard("Run continuity", "Phoenix has not recorded enough history to connect the latest outcome with prior runs yet.");
+  }
+  const latestBackup = snapshot.overview.latestBackup;
+  const latestHealth = snapshot.overview.latestHealth;
+  const latestRollback = snapshot.overview.latestRollback;
+  const latestNotification = snapshot.overview.latestNotification;
+  return renderCard(
+    "Run continuity",
+    `<p>Track how the latest meaningful Phoenix outcome relates to the newest backup, health, rollback, and notification records.</p>
+     <dl class="details-grid">${renderKeyValueList([
+       { label: "Latest meaningful run", value: `${originBadge(latestAction.origin)}<span class="badge badge--muted">${escapeHtml(operationLabel(latestAction.operation))}</span> ${escapeHtml(formatDateTime(latestAction.finishedAt))}` },
+       {
+         label: "Latest backup record",
+         value: latestBackup
+           ? `${originBadge(latestBackup.origin)} ${escapeHtml(formatDateTime(latestBackup.finishedAt))}`
+           : '<span class="muted">Not recorded yet</span>',
+       },
+       {
+         label: "Latest health record",
+         value: latestHealth
+           ? `${statusBadge(latestHealth.result.healthy ? "Healthy" : "Unhealthy", latestHealth.result.healthy ? "ok" : "warning")} ${escapeHtml(formatDateTime(latestHealth.finishedAt))}`
+           : '<span class="muted">Not recorded yet</span>',
+       },
+       {
+         label: "Latest rollback record",
+         value: latestRollback
+           ? `${statusBadge(latestRollback.result.restored ? "Restored" : latestRollback.result.needed ? "Needed" : "Not needed", latestRollback.result.restored ? "warning" : latestRollback.result.needed ? "error" : "ok")} ${escapeHtml(formatDateTime(latestRollback.finishedAt))}`
+           : '<span class="muted">Not recorded yet</span>',
+       },
+       {
+         label: "Latest notification record",
+         value: latestNotification
+           ? `${statusBadge(latestNotification.result.status, latestNotification.result.status === "failed" ? "warning" : latestNotification.result.status === "delivered" ? "ok" : "empty")} ${escapeHtml(formatDateTime(latestNotification.finishedAt))}`
+           : '<span class="muted">Not recorded yet</span>',
+       },
+     ])}</dl>`,
+    { tone: toneForActionStatus(latestAction.status), eyebrow: "Latest outcome to historical record" },
+  );
+}
+
+function renderLatestByOriginCard(snapshot: PhoenixWebSnapshot): string {
+  const latestByOrigin = snapshot.overview.latestByOrigin;
+  const renderOriginValue = (entry: PhoenixActionResult | undefined) => entry
+    ? `${originBadge(entry.origin)}<span class="badge badge--muted">${escapeHtml(operationLabel(entry.operation))}</span> ${escapeHtml(formatDateTime(entry.finishedAt))}`
+    : '<span class="muted">Not recorded yet</span>';
+  return renderCard(
+    "Latest by origin",
+    `<p>Group recent history by watch, hook, and manual pathways so operators can see which Phoenix path last changed the story.</p>
+     <dl class="details-grid">${renderKeyValueList([
+       { label: "Watch", value: renderOriginValue(latestByOrigin.watch) },
+       { label: "Hook", value: renderOriginValue(latestByOrigin.hook) },
+       { label: "Manual", value: renderOriginValue(latestByOrigin.manual) },
+     ])}</dl>`,
+    { tone: "ok", eyebrow: "Run grouping" },
+  );
+}
+
+function renderRunStages(run: PhoenixTimelineRunSummary): string {
+  if (run.stages.length === 0) {
+    return '<p class="activity-detail">No stage trace was recorded for this run.</p>';
+  }
+  return `<div class="activity-stage-list">${run.stages
+    .map((stage) => `<div class="activity-stage activity-stage--${toneForRunStageStatus(stage.status)}"><strong>${escapeHtml(runStageLabel(stage.type))}</strong><span>${escapeHtml(stage.detail)}</span></div>`)
+    .join("")}</div>`;
+}
+
 function renderManualActionState(actionState: PhoenixWebActionState | undefined): string {
   if (actionState?.running) {
     return renderCard(
@@ -697,25 +1000,83 @@ function renderManualActionState(actionState: PhoenixWebActionState | undefined)
   );
 }
 
-function renderManualActions(snapshot: PhoenixWebSnapshot, actionState: PhoenixWebActionState | undefined): string {
+function bindingTone(bindingMode: PhoenixWebConsoleBindingMode): Tone {
+  return bindingMode === "loopback-only" ? "ok" : "warning";
+}
+
+function requestSourceTone(requestSource: PhoenixWebConsoleRequestSource): Tone {
+  return requestSource === "loopback" ? "ok" : requestSource === "remote" ? "warning" : "empty";
+}
+
+function bindingLabel(posture: PhoenixWebConsoleSurfacePosture): string {
+  return posture.bindingMode === "loopback-only"
+    ? `Loopback only (${posture.bindHost})`
+    : `Reachable beyond loopback (${posture.bindHost})`;
+}
+
+function requestSourceLabel(posture: PhoenixWebConsoleSurfacePosture): string {
+  return posture.requestSource === "loopback"
+    ? "Loopback request"
+    : posture.requestSource === "remote"
+      ? "Remote request"
+      : "Request source unknown";
+}
+
+function renderWebSurfaceBoundary(posture: PhoenixWebConsoleSurfacePosture): string {
+  const detail = posture.bindingMode === "loopback-only"
+    ? "Phoenix is bound to loopback, so read-only views and the low-risk browser action surface stay local-first by default."
+    : "Phoenix is bound beyond loopback, so read-only views may be reachable off-host. Phoenix still keeps manual browser actions host-local only and does not treat Web v1 as a remote admin panel.";
+  const requestDetail = posture.requestSource === "remote"
+    ? " This page was loaded from a non-loopback request, so mutation buttons are disabled."
+    : "";
+  return renderCard(
+    "Web surface boundary",
+    `<p>${escapeHtml(`${detail}${requestDetail}`)}</p>
+     <dl class="details-grid">${renderKeyValueList([
+       { label: "Bind posture", value: statusBadge(bindingLabel(posture), bindingTone(posture.bindingMode)) },
+       {
+         label: "Current request",
+         value: `${statusBadge(requestSourceLabel(posture), requestSourceTone(posture.requestSource))}${posture.remoteAddress ? ` <code>${escapeHtml(posture.remoteAddress)}</code>` : ""}`,
+       },
+       {
+         label: "Read-only routes",
+         value: "<code>/overview</code>, <code>/setup</code>, <code>/activity</code>, <code>/archives</code>, <code>/configuration</code>, <code>/api/snapshot</code>, <code>/api/actions/state</code>",
+       },
+       {
+         label: "Mutation routes",
+         value: "<code>POST /api/actions/backup-now</code><br /><code>POST /api/actions/health-check-now</code>",
+       },
+       { label: "Mutation guard", value: escapeHtml(posture.mutationGuardSummary) },
+     ])}</dl>`,
+    { tone: posture.requestSource === "remote" ? "warning" : bindingTone(posture.bindingMode), eyebrow: "Read-only vs mutation boundary" },
+  );
+}
+
+function renderManualActions(
+  snapshot: PhoenixWebSnapshot,
+  actionState: PhoenixWebActionState | undefined,
+  posture: PhoenixWebConsoleSurfacePosture,
+): string {
+  const disabled = posture.manualActionsAvailable ? "" : ' disabled aria-disabled="true"';
   return `<section class="stack" data-manual-actions-root>
     <div>
       <h2>Manual browser actions</h2>
       <p class="muted">These explicit local-only actions stay inside Phoenix's low-risk browser surface. They do not restore live files, mutate hooks, or edit configuration.</p>
+      <p class="muted">${escapeHtml(posture.manualActionsDetail)}</p>
     </div>
     <div class="cards cards--2">
       ${renderCard(
         "Backup now",
         `<p>Create one fresh archive immediately and apply Phoenix retention in the configured output directory. This does not restore anything.</p>
          <p class="muted">Current backup readiness: ${escapeHtml(snapshot.setup.backupReadiness.title)}.</p>
-         <button type="button" class="action-button" data-manual-action="backup-now">Run backup now</button>`,
+         <button type="button" class="action-button" data-manual-action="backup-now"${disabled}>Run backup now</button>`,
         { tone: toneForReadiness(snapshot.setup.backupReadiness.state) },
       )}
       ${renderCard(
         "Health check now",
         `<p>Run <code>openclaw status --json</code> and record a structured healthy/unhealthy result. This browser action does not roll back live state.</p>
          <p class="muted">Use this when you want a fresh operator-visible health verdict without changing deployed files.</p>
-         <button type="button" class="action-button" data-manual-action="health-check-now">Run health check now</button>`,
+         <button type="button" class="action-button" data-manual-action="health-check-now"${disabled}>Run health check now</button>`,
         { tone: "ok" },
       )}
     </div>
@@ -723,7 +1084,11 @@ function renderManualActions(snapshot: PhoenixWebSnapshot, actionState: PhoenixW
   </section>`;
 }
 
-function renderOverview(snapshot: PhoenixWebSnapshot, actionState?: PhoenixWebActionState): string {
+function renderOverview(
+  snapshot: PhoenixWebSnapshot,
+  actionState: PhoenixWebActionState | undefined,
+  posture: PhoenixWebConsoleSurfacePosture,
+): string {
   const protection = deriveProtectionState(snapshot);
   const watchConfig = snapshot.config.origins.watch;
   const hookConfig = snapshot.config.origins.hook;
@@ -744,8 +1109,10 @@ function renderOverview(snapshot: PhoenixWebSnapshot, actionState?: PhoenixWebAc
   );
 
   return `${banner}
-    ${renderManualActions(snapshot, actionState)}
+    ${renderWebSurfaceBoundary(posture)}
+    ${renderManualActions(snapshot, actionState, posture)}
     <div class="cards cards--2">
+      ${renderLatestWebActionCard(snapshot)}
       ${renderExplanationCard(
         "Latest meaningful outcome",
         meaningfulOutcome,
@@ -839,24 +1206,37 @@ function describeActivity(entry: PhoenixActionResult): string {
   return parts.join(" • ");
 }
 
-function renderActivity(timeline: PhoenixTimelineReadModel): string {
-  if (timeline.entries.length === 0) {
+function renderActivity(snapshot: PhoenixWebSnapshot): string {
+  if (snapshot.timeline.entries.length === 0) {
     return renderEmptyCard("Activity", "Phoenix has not recorded any actions yet.");
   }
-  return `<section class="stack">${timeline.entries
-    .map((entry) => renderCard(
-      entry.summary,
-      `<div class="inline-badges">${statusBadge(entry.status.toUpperCase(), toneForActionStatus(entry.status))}${originBadge(entry.origin)}<span class="badge badge--muted">${escapeHtml(entry.operation)}</span></div>
-       <dl class="details-grid">${renderKeyValueList([
-         { label: "Started", value: escapeHtml(formatDateTime(entry.startedAt)) },
-         { label: "Finished", value: escapeHtml(formatDateTime(entry.finishedAt)) },
-         { label: "Config path", value: formatPath(entry.config.configPath) },
-         { label: "Output dir", value: formatPath(entry.config.outputDir) },
-       ])}</dl>
-       <p class="activity-detail">${escapeHtml(describeActivity(entry) || "No additional structured details were recorded for this action.")}</p>`,
-      { tone: toneForActionStatus(entry.status) },
-    ))
-    .join("")}</section>`;
+  const entriesById = new Map(snapshot.timeline.entries.map((entry) => [entry.id, entry]));
+  return `<div class="cards cards--2">
+      ${renderRunContinuityCard(snapshot)}
+      ${renderLatestWebActionCard(snapshot)}
+      ${renderLatestByOriginCard(snapshot)}
+    </div>
+    <section class="stack">${snapshot.timeline.runs
+      .map((run) => {
+        const entry = entriesById.get(run.actionId);
+        return renderCard(
+          run.summary,
+          `<div class="inline-badges">${statusBadge(run.status.toUpperCase(), toneForActionStatus(run.status))}${originBadge(run.origin)}${statusBadge(triggerLabel(run.trigger), triggerTone(run.trigger))}<span class="badge badge--muted">${escapeHtml(operationLabel(run.operation))}</span>${run.roles.map((role) => statusBadge(runRoleLabel(role), runRoleTone(role))).join("")}</div>
+           <dl class="details-grid">${renderKeyValueList([
+             { label: "Started", value: escapeHtml(formatDateTime(run.startedAt)) },
+             { label: "Finished", value: escapeHtml(formatDateTime(run.finishedAt)) },
+             { label: "Run id", value: `<code>${escapeHtml(run.actionId)}</code>` },
+             { label: "Config path", value: formatPath(entry?.config.configPath) },
+             { label: "Output dir", value: formatPath(entry?.config.outputDir) },
+             { label: "Retain", value: entry?.config.retain !== undefined ? escapeHtml(String(entry.config.retain)) : '<span class="muted">Not recorded yet</span>' },
+             { label: "Notification policy", value: escapeHtml(entry?.config.notification.policy ?? "off") },
+           ])}</dl>
+           <p class="activity-detail">${escapeHtml(entry ? (describeActivity(entry) || "No additional structured details were recorded for this action.") : run.summary)}</p>
+           ${renderRunStages(run)}`,
+          { tone: toneForActionStatus(run.status), eyebrow: run.roles.length > 0 ? run.roles.map(runRoleLabel).join(" • ") : "Run history" },
+        );
+      })
+      .join("")}</section>`;
 }
 
 function renderArchiveItem(archive: PhoenixArchiveSummaryItem): string {
@@ -1114,8 +1494,12 @@ function renderFreshnessClientScript(snapshot: PhoenixWebSnapshot): string {
   </script>`;
 }
 
-function renderManualActionClientScript(actionState: PhoenixWebActionState | undefined): string {
+function renderManualActionClientScript(
+  actionState: PhoenixWebActionState | undefined,
+  posture: PhoenixWebConsoleSurfacePosture,
+): string {
   const payload = JSON.stringify(actionState ?? {});
+  const manualActionsAvailable = posture.manualActionsAvailable ? "true" : "false";
   return `<script>
     (() => {
       const root = document.querySelector('[data-manual-actions-root]');
@@ -1130,9 +1514,10 @@ function renderManualActionClientScript(actionState: PhoenixWebActionState | und
       let state = ${payload};
       let pollTimer = 0;
       let waitingForCompletion = Boolean(state?.running);
+      const manualActionsAvailable = ${manualActionsAvailable};
 
       const updateButtons = () => {
-        const disabled = Boolean(state?.running);
+        const disabled = Boolean(state?.running) || !manualActionsAvailable;
         for (const button of buttons) {
           if (button instanceof HTMLButtonElement) {
             button.disabled = disabled;
@@ -1197,7 +1582,12 @@ function renderManualActionClientScript(actionState: PhoenixWebActionState | und
           try {
             const response = await fetch('/api/actions/' + action, {
               method: 'POST',
-              headers: { accept: 'application/json' },
+              headers: {
+                accept: 'application/json',
+                'content-type': 'application/json',
+                '${PHOENIX_WEB_MANUAL_ACTION_HEADER}': action,
+              },
+              body: JSON.stringify({ action }),
             });
             const payload = await response.json().catch(() => ({}));
             if (!response.ok) {
@@ -1220,7 +1610,13 @@ function renderManualActionClientScript(actionState: PhoenixWebActionState | und
   </script>`;
 }
 
-function renderLayout(view: PhoenixConsoleView, snapshot: PhoenixWebSnapshot, body: string, actionState?: PhoenixWebActionState): string {
+function renderLayout(
+  view: PhoenixConsoleView,
+  snapshot: PhoenixWebSnapshot,
+  body: string,
+  posture: PhoenixWebConsoleSurfacePosture,
+  actionState?: PhoenixWebActionState,
+): string {
   const protection = deriveProtectionState(snapshot);
   const freshness = buildFreshnessExplanation(snapshot);
   const nav = (Object.keys(VIEW_TITLES) as PhoenixConsoleView[])
@@ -1278,6 +1674,12 @@ function renderLayout(view: PhoenixConsoleView, snapshot: PhoenixWebSnapshot, bo
       .badge--empty, .badge--muted, .badge--origin { background: rgba(148, 163, 184, 0.18); color: #cbd5e1; }
       .inline-badges { margin-bottom: 8px; }
       .muted, .empty-state, .activity-detail { color: #94a3b8; }
+      .activity-stage-list { display: grid; gap: 10px; margin-top: 14px; }
+      .activity-stage { border: 1px solid #334155; border-radius: 12px; padding: 10px 12px; background: rgba(15, 23, 42, 0.45); }
+      .activity-stage strong { display: block; margin-bottom: 4px; font-size: 0.84rem; }
+      .activity-stage--ok strong { color: #86efac; }
+      .activity-stage--warning strong { color: #fde68a; }
+      .activity-stage--error strong { color: #fecaca; }
       .command-preview { margin: 0; white-space: pre-wrap; word-break: break-word; background: rgba(15, 23, 42, 0.65); border: 1px solid #334155; border-radius: 12px; padding: 14px; }
       @media (max-width: 760px) { .shell { padding: 16px; } .topbar { flex-direction: column; align-items: flex-start; } .topbar__status { max-width: none; width: 100%; } }
     </style>
@@ -1290,8 +1692,9 @@ function renderLayout(view: PhoenixConsoleView, snapshot: PhoenixWebSnapshot, bo
           <p class="muted">Local operator console built from the Phoenix Web v1 snapshot contract, with only low-risk browser actions enabled.</p>
         </div>
         <div class="topbar__status">
-          <div class="inline-badges"><span class="badge badge--${freshness.tone}" data-freshness-badge>${escapeHtml(freshness.eyebrow)}</span></div>
+          <div class="inline-badges"><span class="badge badge--${freshness.tone}" data-freshness-badge>${escapeHtml(freshness.eyebrow)}</span>${statusBadge(bindingLabel(posture), bindingTone(posture.bindingMode))}</div>
           <p class="muted" data-freshness-text>${escapeHtml(freshness.detail)}</p>
+          <p class="muted">${escapeHtml(posture.manualActionsDetail)}</p>
           <button type="button" class="refresh-button" data-refresh-now>Refresh now</button>
         </div>
         <nav class="nav">${nav}<a class="nav__link" href="/api/snapshot">Snapshot JSON</a></nav>
@@ -1304,23 +1707,28 @@ function renderLayout(view: PhoenixConsoleView, snapshot: PhoenixWebSnapshot, bo
       ${body}
     </main>
     ${renderFreshnessClientScript(snapshot)}
-    ${view === "overview" ? renderManualActionClientScript(actionState) : ""}
+    ${view === "overview" ? renderManualActionClientScript(actionState, posture) : ""}
   </body>
 </html>`;
 }
 
-export function renderPhoenixWebConsolePage(snapshot: PhoenixWebSnapshot, view: PhoenixConsoleView, actionState?: PhoenixWebActionState): string {
+export function renderPhoenixWebConsolePage(
+  snapshot: PhoenixWebSnapshot,
+  view: PhoenixConsoleView,
+  actionState?: PhoenixWebActionState,
+  posture = derivePhoenixWebConsoleSurfacePosture({ bindHost: "127.0.0.1", defaultToLoopbackRequest: true }),
+): string {
   switch (view) {
     case "overview":
-      return renderLayout(view, snapshot, renderOverview(snapshot, actionState), actionState);
+      return renderLayout(view, snapshot, renderOverview(snapshot, actionState, posture), posture, actionState);
     case "setup":
-      return renderLayout(view, snapshot, renderSetup(snapshot), actionState);
+      return renderLayout(view, snapshot, renderSetup(snapshot), posture, actionState);
     case "activity":
-      return renderLayout(view, snapshot, renderActivity(snapshot.timeline), actionState);
+      return renderLayout(view, snapshot, renderActivity(snapshot), posture, actionState);
     case "archives":
-      return renderLayout(view, snapshot, renderArchives(snapshot), actionState);
+      return renderLayout(view, snapshot, renderArchives(snapshot), posture, actionState);
     case "configuration":
-      return renderLayout(view, snapshot, renderConfiguration(snapshot), actionState);
+      return renderLayout(view, snapshot, renderConfiguration(snapshot), posture, actionState);
   }
 }
 
@@ -1355,7 +1763,13 @@ function normalizeManualAction(pathname: string): PhoenixWebManualAction | undef
 }
 
 function writeResponse(response: http.ServerResponse, status: number, contentType: string, body: string, method = "GET") {
-  response.writeHead(status, { "content-type": `${contentType}; charset=utf-8` });
+  response.writeHead(status, {
+    "cache-control": "no-store",
+    "content-type": `${contentType}; charset=utf-8`,
+    "referrer-policy": "no-referrer",
+    "x-content-type-options": "nosniff",
+    "x-frame-options": "DENY",
+  });
   if (method === "HEAD") {
     response.end();
     return;
@@ -1364,13 +1778,16 @@ function writeResponse(response: http.ServerResponse, status: number, contentTyp
 }
 
 export async function startPhoenixWebConsole(options: StartPhoenixWebConsoleOptions): Promise<PhoenixWebConsoleServer> {
+  const bindHost = options.host ?? "127.0.0.1";
   let closeResolver = () => {};
   const closed = new Promise<void>((resolve) => {
     closeResolver = resolve;
   });
   const server = http.createServer(async (request, response) => {
     const method = request.method ?? "GET";
-    const url = new URL(request.url ?? "/", `http://${request.headers.host ?? "127.0.0.1"}`);
+    const requestHost = readHeaderValue(request.headers.host) ?? bindHost;
+    const posture = derivePhoenixWebConsoleSurfacePosture({ bindHost, remoteAddress: request.socket.remoteAddress });
+    const url = new URL(request.url ?? "/", toHttpUrl(requestHost));
     if (url.pathname === "/api/actions/state") {
       if (!options.actionController) {
         writeResponse(response, 404, "application/json", `${JSON.stringify({ ok: false, error: "Manual browser actions are unavailable." }, null, 2)}\n`, method);
@@ -1389,8 +1806,24 @@ export async function startPhoenixWebConsole(options: StartPhoenixWebConsoleOpti
         writeResponse(response, 404, "application/json", `${JSON.stringify({ ok: false, error: "Manual browser actions are unavailable." }, null, 2)}\n`, method);
         return;
       }
-      if (method !== "POST") {
-        writeResponse(response, 405, "text/plain", "Method Not Allowed", method);
+      const access = evaluatePhoenixWebManualActionRequest({
+        action: manualAction,
+        bindHost,
+        method,
+        remoteAddress: request.socket.remoteAddress,
+        requestHost,
+        origin: readHeaderValue(request.headers.origin),
+        secFetchSite: readHeaderValue(request.headers["sec-fetch-site"]),
+        requestHeader: readHeaderValue(request.headers[PHOENIX_WEB_MANUAL_ACTION_HEADER]),
+      });
+      if (!access.ok) {
+        writeResponse(
+          response,
+          access.status,
+          "application/json",
+          `${JSON.stringify({ ok: false, error: access.error, state: options.actionController.getState() }, null, 2)}\n`,
+          method,
+        );
         return;
       }
       const result = await options.actionController.start(manualAction);
@@ -1417,7 +1850,7 @@ export async function startPhoenixWebConsole(options: StartPhoenixWebConsoleOpti
     }
     try {
       const snapshot = await options.loadSnapshot();
-      writeResponse(response, 200, "text/html", renderPhoenixWebConsolePage(snapshot, view, options.actionController?.getState()), method);
+      writeResponse(response, 200, "text/html", renderPhoenixWebConsolePage(snapshot, view, options.actionController?.getState(), posture), method);
     } catch (error) {
       writeResponse(response, 500, "text/html", renderPhoenixWebConsoleErrorPage({ error, pathname: url.pathname, view }), method);
     }
@@ -1425,14 +1858,14 @@ export async function startPhoenixWebConsole(options: StartPhoenixWebConsoleOpti
   server.on("close", () => closeResolver());
   await new Promise<void>((resolve, reject) => {
     server.once("error", reject);
-    server.listen(options.port ?? 48789, options.host ?? "127.0.0.1", () => {
+    server.listen(options.port ?? 48789, bindHost, () => {
       server.off("error", reject);
       resolve();
     });
   });
   const address = server.address() as AddressInfo;
   return {
-    url: `http://${options.host ?? "127.0.0.1"}:${address.port}`,
+    url: `http://${bindHost}:${address.port}`,
     close: async () => {
       if (!server.listening) {
         return;

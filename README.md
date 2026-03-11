@@ -367,8 +367,8 @@ openclaw-phoenix web snapshot \
 
 The JSON snapshot includes five top-level sections:
 
-- `overview`: latest action plus latest backup/health/rollback/notification/restore outcomes
-- `timeline`: recent structured actions with `origin` preserved as `watch`, `hook`, or `manual`
+- `overview`: latest action plus latest backup/health/rollback/notification/restore outcomes, including the latest durable web-triggered action when one exists
+- `timeline`: recent structured actions with `origin` preserved as `watch`, `hook`, or `manual`, plus derived run summaries that trace backup/health/known-good/rollback/notification stages and continuity roles such as `latest-action` or `latest-web`
 - `config`: deployment path summary plus last-known per-origin runtime settings
 - `archives`: known-good/last-backup pointers plus archive inventory with roles
 - `setup`: guided readiness checks for environment, output dir, retain count, self-heal, notifications, and preview commands
@@ -394,15 +394,17 @@ Host/port behavior:
 - Default bind is `127.0.0.1:48789`, so Web v1 is local-only by default and intended to be opened from the same machine.
 - `--port 0` asks the OS for any free port; Phoenix prints the actual chosen URL after startup.
 - `--host 0.0.0.0` or a specific LAN interface makes the console reachable beyond loopback, but you should open it via that machine's actual hostname/IP rather than the literal `0.0.0.0` address.
-- Web v1 serves plain local HTTP and does not add browser-side auth or mutation controls. If you bind beyond loopback, put it behind your own access controls.
+- Web v1 serves plain local HTTP and is still not intended as a remote admin panel. If you bind beyond loopback, add your own access controls and treat the browser surface as read-mostly visibility.
+- The two mutation routes stay narrower than the read-only routes: Phoenix accepts `POST /api/actions/backup-now` and `POST /api/actions/health-check-now` only from a loopback request on the Phoenix host, with the console's own same-origin request header and same-origin browser metadata when present.
 
 The local console stays intentionally narrow in this slice:
 
 - `Overview` shows the current protection posture, watch mode, hook install state, latest results, and the latest known-good archive.
 - `Overview` now also explains why Phoenix currently looks healthy, limited, degraded, or failed; why rollback did or did not happen; why notifications did or did not fire; and when the browser view may be stale.
 - `Overview` also provides two explicit local-only buttons: `Backup now` creates one fresh archive and applies Phoenix retention, while `Health check now` runs `openclaw status --json` and records a structured healthy/unhealthy result without restoring anything.
+- `Overview` also shows the current read-only vs mutation boundary, the bind posture, and whether the current request is allowed to trigger the low-risk browser mutations.
 - `Setup` shows guided prerequisite checks, required vs optional vs advanced settings, hard blockers vs warnings vs info, backup-only vs self-heal readiness, and preview commands you can copy into a terminal yourself.
-- `Activity` shows recent Phoenix actions with explicit watch vs hook vs manual origin labels, timestamps, config/output paths, and a short structured outcome summary.
+- `Activity` now centers recent Phoenix runs rather than only a flat event list: it shows continuity between the latest meaningful outcome and the latest backup/health/rollback/notification records, durable visibility for web-triggered actions, per-origin grouping, and operator-readable stage traces for backup / health / known-good / rollback / notification outcomes over time.
 - `Archives` shows the retained archive inventory plus latest-known-good and last-backup roles, sizes, timestamps, and archive paths.
 - `Configuration` shows a read-only deployment summary plus last-known watch/hook origin settings, notification policy, and any degraded or warning state.
 
@@ -412,6 +414,7 @@ Current Web v1 boundary:
 
 - local-first: optimized for an operator already on the Phoenix host, with loopback binding as the default
 - low-risk only: the browser can inspect the current snapshot contract and `/api/snapshot`, and it may run only `backup now` or `health check now`; it does not run restore, install/remove hooks, edit config, or send notifications
+- mutation-guarded: read-only routes stay separate from mutation routes, and the two browser-triggered mutations are accepted only from loopback with Phoenix's own same-origin request contract
 - guidance-focused: the browser explains readiness, state, and next-step commands, but you still perform real changes through the `openclaw-phoenix` CLI
 
 ## Notification behavior
