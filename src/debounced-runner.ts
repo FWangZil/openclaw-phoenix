@@ -3,6 +3,7 @@ export class DebouncedRunner {
   private dirty = false;
   private running = false;
   private closed = false;
+  private activeRun: Promise<void> | null = null;
 
   constructor(
     private readonly debounceMs: number,
@@ -26,12 +27,13 @@ export class DebouncedRunner {
     }, this.debounceMs);
   }
 
-  close() {
+  async close(): Promise<void> {
     this.closed = true;
     if (this.timer) {
       clearTimeout(this.timer);
       this.timer = null;
     }
+    await this.activeRun;
   }
 
   private async flush(): Promise<void> {
@@ -41,9 +43,14 @@ export class DebouncedRunner {
     this.dirty = false;
     this.timer = null;
     this.running = true;
+    const activeRun = this.run();
+    this.activeRun = activeRun;
     try {
-      await this.run();
+      await activeRun;
     } finally {
+      if (this.activeRun === activeRun) {
+        this.activeRun = null;
+      }
       this.running = false;
       if (this.dirty && !this.closed) {
         this.timer = setTimeout(() => {

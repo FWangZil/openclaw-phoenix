@@ -2,6 +2,7 @@ import { constants as fsConstants } from "node:fs";
 import { randomUUID } from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";
+import { resolveConfigOnlyBackupOutputDir } from "./backup.js";
 import {
   DEFAULT_HOOK_EVENT,
   readPhoenixHookInstallRecord,
@@ -29,7 +30,14 @@ export type PhoenixWebOperation = "backup-cycle" | "recovery-cycle" | "restore" 
 export type PhoenixWebActionStatus = "ok" | "warning" | "error";
 export type PhoenixWebNotificationMode = "off" | "exceptional-only" | "all";
 export type PhoenixWebActionTriggerSource = "watch" | "hook" | "cli" | "web-console";
-export type PhoenixWebActionTriggerRequest = "backup-now" | "health-check-now";
+export type PhoenixWebActionTriggerRequest =
+  | "backup-now"
+  | "health-check-now"
+  | "watch-start"
+  | "watch-stop"
+  | "hook-install"
+  | "hook-remove"
+  | "hook-run";
 
 export type PhoenixWebActionTrigger = {
   source: PhoenixWebActionTriggerSource;
@@ -55,6 +63,7 @@ export type PhoenixWebRunConfig = {
 export type PhoenixWebBackupResult = {
   attempted: boolean;
   archivePath?: string;
+  configOnlyArchivePath?: string;
   error?: string;
 };
 
@@ -407,12 +416,16 @@ function summarizeRecoveryAction(options: {
   return `${originLabel} recovery detected unhealthy status with no known-good archive to restore.`;
 }
 
+function pickDisplayedBackupArchive(backup: PhoenixWebBackupResult): string | undefined {
+  return backup.archivePath ?? backup.configOnlyArchivePath;
+}
+
 function summarizeBackupCycleAction(backup: PhoenixWebBackupResult, retention: RetentionResult): string {
   if (backup.error) {
     return `Watch backup cycle failed: ${backup.error}`;
   }
   const deletedSuffix = retention.deleted.length > 0 ? ` Retention pruned ${retention.deleted.length} archive(s).` : "";
-  return `Watch backup cycle created ${path.basename(backup.archivePath ?? "archive")}.${deletedSuffix}`.trim();
+  return `Watch backup cycle created ${path.basename(pickDisplayedBackupArchive(backup) ?? "archive")}.${deletedSuffix}`.trim();
 }
 
 function summarizeBackupAction(options: {
@@ -427,7 +440,7 @@ function summarizeBackupAction(options: {
     return `Manual backup failed: ${options.backup.error}`;
   }
   const deletedSuffix = options.retention.deleted.length > 0 ? ` Retention pruned ${options.retention.deleted.length} archive(s).` : "";
-  return `Manual backup created ${path.basename(options.backup.archivePath ?? "archive")}.${deletedSuffix}`.trim();
+  return `Manual backup created ${path.basename(pickDisplayedBackupArchive(options.backup) ?? "archive")}.${deletedSuffix}`.trim();
 }
 
 function summarizeHealthCheckAction(options: {
@@ -440,9 +453,9 @@ function summarizeHealthCheckAction(options: {
     return `${originLabel} health check failed: ${options.health.reason ?? "No reason recorded"}`;
   }
   if (options.health.healthy) {
-    return `${originLabel} health check reported healthy status${options.health.reason ? ` (${options.health.reason})` : ""}.`;
+    return `${originLabel} health check completed and reported healthy status${options.health.reason ? ` (${options.health.reason})` : ""}.`;
   }
-  return `${originLabel} health check reported unhealthy status${options.health.reason ? ` (${options.health.reason})` : ""}.`;
+  return `${originLabel} health check completed and reported unhealthy status${options.health.reason ? ` (${options.health.reason})` : ""}.`;
 }
 
 function summarizeRestoreAction(options: {
@@ -741,7 +754,7 @@ function buildTimelineRunStages(entry: PhoenixActionResult): PhoenixTimelineRunS
   if (entry.backup?.attempted) {
     stages.push(entry.backup.error
       ? { type: "backup", status: "error", detail: `Backup failed: ${entry.backup.error}` }
-      : { type: "backup", status: "ok", detail: `Backup wrote ${path.basename(entry.backup.archivePath ?? "archive")}` });
+      : { type: "backup", status: "ok", detail: `Backup wrote ${path.basename(pickDisplayedBackupArchive(entry.backup) ?? "archive")}` });
   }
   if (entry.health?.attempted) {
     stages.push({
@@ -866,30 +879,37 @@ function buildTimelineRuns(entries: PhoenixActionResult[], roleMap: Map<string, 
 }
 
 async function summarizeArchives(outputDir: string, latestKnownGoodArchivePath?: string, lastBackupArchivePath?: string) {
-  const entries = await fs.readdir(outputDir, { withFileTypes: true }).catch(() => []);
+  const directories = [outputDir, resolveConfigOnlyBackupOutputDir(outputDir)]
+    .map((directory) => path.resolve(directory))
+    .filter((directory, index, all) => all.indexOf(directory) === index);
   const archives = await Promise.all(
-    entries
-      .filter((entry) => entry.isFile() && entry.name.endsWith(OPENCLAW_BACKUP_ARCHIVE_SUFFIX))
-      .map(async (entry) => {
-        const archivePath = path.join(outputDir, entry.name);
-        const stat = await fs.stat(archivePath);
-        const roles: PhoenixArchiveRole[] = [];
-        if (latestKnownGoodArchivePath && normalizePathKey(archivePath) === normalizePathKey(latestKnownGoodArchivePath)) {
-          roles.push("latest-known-good");
-        }
-        if (lastBackupArchivePath && normalizePathKey(archivePath) === normalizePathKey(lastBackupArchivePath)) {
-          roles.push("last-backup");
-        }
-        return {
-          archivePath,
-          fileName: entry.name,
-          mtimeAt: stat.mtime.toISOString(),
-          sizeBytes: stat.size,
-          roles,
-        } satisfies PhoenixArchiveSummaryItem;
-      }),
+    directories.map(async (directory) => {
+      const entries = await fs.readdir(directory, { withFileTypes: true }).catch(() => []);
+      return Promise.all(
+        entries
+          .filter((entry) => entry.isFile() && entry.name.endsWith(OPENCLAW_BACKUP_ARCHIVE_SUFFIX))
+          .map(async (entry) => {
+            const archivePath = path.join(directory, entry.name);
+            const stat = await fs.stat(archivePath);
+            const roles: PhoenixArchiveRole[] = [];
+            if (latestKnownGoodArchivePath && normalizePathKey(archivePath) === normalizePathKey(latestKnownGoodArchivePath)) {
+              roles.push("latest-known-good");
+            }
+            if (lastBackupArchivePath && normalizePathKey(archivePath) === normalizePathKey(lastBackupArchivePath)) {
+              roles.push("last-backup");
+            }
+            return {
+              archivePath,
+              fileName: entry.name,
+              mtimeAt: stat.mtime.toISOString(),
+              sizeBytes: stat.size,
+              roles,
+            } satisfies PhoenixArchiveSummaryItem;
+          }),
+      );
+    }),
   );
-  return archives.toSorted((left, right) => right.mtimeAt.localeCompare(left.mtimeAt));
+  return archives.flat().toSorted((left, right) => right.mtimeAt.localeCompare(left.mtimeAt));
 }
 
 async function pathStat(targetPath: string) {

@@ -13,24 +13,45 @@
     "openclaw-phoenix": "./dist/cli.js"
   },
   "scripts": {
-    "build": "tsc -p ./tsconfig.json && node ./scripts/postbuild.mjs",
+    "build": "tsc -p ./tsconfig.json && bun run build:web && node ./scripts/postbuild.mjs",
+    "build:web": "vite build --config ./web/vite.config.ts",
+    "dev:web": "node ./scripts/web-dev.mjs",
     "prepare": "npm run build",
+    "start:web": "node --import tsx ./src/cli.ts web serve",
+    "start:web:dist": "node ./dist/cli.js web serve",
+    "web:dev": "node ./scripts/web-dev.mjs",
+    "web:start": "node --import tsx ./src/cli.ts web serve",
+    "web:start:dist": "node ./dist/cli.js web serve",
     "watch": "node --import tsx ./src/cli.ts watch",
     "test": "vitest run --config ./vitest.config.ts",
-    "typecheck": "tsc -p ./tsconfig.typecheck.json --noEmit",
+    "typecheck": "tsc -p ./tsconfig.typecheck.json --noEmit && tsc -p ./web/tsconfig.json --noEmit",
     "smoke:cli": "node ./dist/cli.js --help && node ./dist/cli.js doctor --help && node ./dist/cli.js watch --help && node ./dist/cli.js restore --help && node ./dist/cli.js hook --help && node ./dist/cli.js web --help",
     "smoke:standalone": "npm run build && node ./scripts/smoke-standalone.mjs"
   },
   "dependencies": {
+    "@phosphor-icons/react": "^2.1.10",
     "chokidar": "^5.0.0",
     "commander": "^14.0.3",
+    "framer-motion": "^12.35.2",
+    "i18next": "^25.6.0",
     "json5": "^2.2.3",
+    "react": "^19.1.1",
+    "react-dom": "^19.1.1",
+    "react-i18next": "^16.0.1",
+    "react-router-dom": "^7.9.3",
     "tar": "^7.5.1"
   },
   "devDependencies": {
+    "@testing-library/jest-dom": "^6.9.1",
+    "@testing-library/react": "^16.3.0",
     "@types/node": "^25.3.5",
+    "@types/react": "^19.1.13",
+    "@types/react-dom": "^19.1.9",
+    "@vitejs/plugin-react": "^5.0.4",
+    "jsdom": "^27.0.0",
     "tsx": "^4.21.0",
     "typescript": "^5.9.3",
+    "vite": "^7.1.7",
     "vitest": "^4.0.18"
   },
   "engines": {

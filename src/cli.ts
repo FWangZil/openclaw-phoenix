@@ -257,6 +257,7 @@ async function main() {
     .option("--output <dir>", "Directory for Phoenix backup archives and state", DEFAULT_OUTPUT_DIR)
     .option("--host <host>", "Host interface to bind for the local Phoenix console", "127.0.0.1")
     .option("--port <port>", "Port for the local Phoenix console (0 = random available port)", parsePort, 48789)
+    .option("--dev-origin <origin>", "Absolute Vite dev-server origin to use for HMR assets instead of dist/web")
     .option(
       "--timeline-limit <count>",
       "How many recent timeline entries to include in the Phoenix web console",
@@ -266,21 +267,27 @@ async function main() {
     .action(async (options) => {
       const configPath = options.config ? resolveUserPath(options.config) : undefined;
       const outputDir = resolveOutputDir(options.output);
+      const loadSnapshot = async () => buildPhoenixWebSnapshot({
+        configPath,
+        env: process.env,
+        outputDir,
+        timelineLimit: options.timelineLimit,
+      });
       const server = await startPhoenixWebConsole({
         host: options.host,
         port: options.port,
+        devAssetOrigin: options.devOrigin,
         actionController: createPhoenixWebActionController({
           configPath,
           openclawBin: options.openclawBin,
           outputDir,
           retain: DEFAULT_RETAIN,
+          phoenixCommand: resolvePhoenixCommand({
+            argv: process.argv,
+          }),
+          loadSnapshot,
         }),
-        loadSnapshot: async () => buildPhoenixWebSnapshot({
-          configPath,
-          env: process.env,
-          outputDir,
-          timelineLimit: options.timelineLimit,
-        }),
+        loadSnapshot,
       });
       const posture = derivePhoenixWebConsoleSurfacePosture({ bindHost: options.host, defaultToLoopbackRequest: true });
       console.log(`Phoenix web console listening at ${server.url}`);

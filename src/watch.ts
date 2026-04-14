@@ -1,24 +1,29 @@
 import fs from "node:fs/promises";
+import net from "node:net";
 import path from "node:path";
 import chokidar from "chokidar";
-import { runOpenClawBackupCreate } from "./backup.js";
+import { runOpenClawBackupCreateBatch, runOpenClawCommand } from "./backup.js";
 import { DebouncedRunner } from "./debounced-runner.js";
 import { type PhoenixNotificationConfig } from "./notify.js";
 import { normalizePathKey, shortenHomePath } from "./paths.js";
 import { runPhoenixRecovery } from "./recovery.js";
-import { pruneBackupArchives } from "./retention.js";
+import { prunePhoenixBackupArchives } from "./retention.js";
 import { type WatchPlan, resolveWatchPlan } from "./watch-plan.js";
 import { recordPhoenixBackupWatchAction } from "./web-contract.js";
 
 export const DEFAULT_DEBOUNCE_MS = 1_000;
 export const DEFAULT_RETAIN = 100;
+const DEFAULT_GATEWAY_PORT = 18_789;
+const GATEWAY_PROBE_TIMEOUT_MS = 300;
 
 export type StartBackupWatchOptions = {
   configPath?: string;
   debounceMs?: number;
   env?: NodeJS.ProcessEnv;
+  gatewayPort?: number;
   openclawBin: string;
   outputDir: string;
+  probeGatewayPort?: (options: { env: NodeJS.ProcessEnv; port: number }) => Promise<boolean>;
   retain?: number;
   selfHeal?: boolean;
   notification?: PhoenixNotificationConfig;
@@ -36,15 +41,77 @@ function formatArchivePath(archivePath: string | undefined, env: NodeJS.ProcessE
   return archivePath ? shortenHomePath(archivePath, env) : "(path unavailable)";
 }
 
+async function probeLocalGatewayPort(port: number): Promise<boolean> {
+  return await new Promise<boolean>((resolve) => {
+    const socket = net.createConnection({ host: "127.0.0.1", port });
+    let settled = false;
+    const finish = (value: boolean) => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      socket.destroy();
+      resolve(value);
+    };
+    socket.setTimeout(GATEWAY_PROBE_TIMEOUT_MS);
+    socket.once("connect", () => finish(true));
+    socket.once("timeout", () => finish(false));
+    socket.once("error", () => finish(false));
+  });
+}
+
+async function ensureGatewayPhoenix(options: {
+  env: NodeJS.ProcessEnv;
+  error: (message: string) => void;
+  gatewayPort: number;
+  log: (message: string) => void;
+  openclawBin: string;
+  probeGatewayPort?: (options: { env: NodeJS.ProcessEnv; port: number }) => Promise<boolean>;
+}) {
+  const probe = options.probeGatewayPort ?? ((probeOptions: { port: number }) => probeLocalGatewayPort(probeOptions.port));
+  const listening = await probe({ env: options.env, port: options.gatewayPort });
+  if (listening) {
+    return;
+  }
+  options.error(
+    `gateway phoenix detected no process on 127.0.0.1:${options.gatewayPort}; attempting openclaw gateway start`,
+  );
+  try {
+    await runOpenClawCommand({
+      openclawBin: options.openclawBin,
+      args: ["gateway", "start"],
+      env: options.env,
+      label: "openclaw gateway start",
+    });
+    options.log(`gateway phoenix restarted local gateway on 127.0.0.1:${options.gatewayPort}`);
+    return;
+  } catch (startError) {
+    options.error(`gateway phoenix start failed: ${String(startError)}; attempting install + start`);
+  }
+  await runOpenClawCommand({
+    openclawBin: options.openclawBin,
+    args: ["gateway", "install"],
+    env: options.env,
+    label: "openclaw gateway install",
+  });
+  await runOpenClawCommand({
+    openclawBin: options.openclawBin,
+    args: ["gateway", "start"],
+    env: options.env,
+    label: "openclaw gateway start",
+  });
+  options.log(`gateway phoenix reinstalled and restarted local gateway on 127.0.0.1:${options.gatewayPort}`);
+}
+
 async function runBackupOnlyWatchCycle(options: StartBackupWatchOptions, effectiveEnv: NodeJS.ProcessEnv, log: (message: string) => void) {
   const startedAt = new Date().toISOString();
   try {
-    const result = await runOpenClawBackupCreate({
+    const result = await runOpenClawBackupCreateBatch({
       openclawBin: options.openclawBin,
       outputDir: `${options.outputDir}${path.sep}`,
       env: effectiveEnv,
     });
-    const retention = await pruneBackupArchives({
+    const retention = await prunePhoenixBackupArchives({
       directory: options.outputDir,
       retain: options.retain ?? DEFAULT_RETAIN,
     });
@@ -57,12 +124,20 @@ async function runBackupOnlyWatchCycle(options: StartBackupWatchOptions, effecti
       backup: {
         attempted: true,
         archivePath: result.archivePath,
+        configOnlyArchivePath: result.configOnlyArchivePath,
+        error: result.error,
       },
       retention,
     });
+    if (result.configOnlyArchivePath) {
+      log(`config-only backup complete: ${formatArchivePath(result.configOnlyArchivePath, effectiveEnv)}`);
+    }
     log(`backup complete: ${formatArchivePath(result.archivePath, effectiveEnv)}`);
     if (retention.deleted.length > 0) {
       log(`retention pruned ${retention.deleted.length} old archive(s)`);
+    }
+    if (result.error) {
+      throw new Error(result.error);
     }
   } catch (error) {
     await recordPhoenixBackupWatchAction({
@@ -86,7 +161,7 @@ async function runSelfHealWatchCycle(
   effectiveEnv: NodeJS.ProcessEnv,
   log: (message: string) => void,
   error: (message: string) => void,
-) {
+): Promise<boolean> {
   const recovery = await runPhoenixRecovery({
     configPath: options.configPath,
     openclawBin: options.openclawBin,
@@ -99,6 +174,9 @@ async function runSelfHealWatchCycle(
   });
   if (recovery.backup.archivePath) {
     log(`backup complete: ${formatArchivePath(recovery.backup.archivePath, effectiveEnv)}`);
+  }
+  if (recovery.backup.configOnlyArchivePath) {
+    log(`config-only backup complete: ${formatArchivePath(recovery.backup.configOnlyArchivePath, effectiveEnv)}`);
   }
   if (recovery.backup.error) {
     error(`backup cycle failed: ${recovery.backup.error}`);
@@ -123,6 +201,7 @@ async function runSelfHealWatchCycle(
   if (recovery.retention.deleted.length > 0) {
     log(`retention pruned ${recovery.retention.deleted.length} old archive(s)`);
   }
+  return recovery.rollback.restored;
 }
 
 export async function startBackupWatch(options: StartBackupWatchOptions): Promise<BackupWatchSession> {
@@ -154,6 +233,7 @@ export async function startBackupWatch(options: StartBackupWatchOptions): Promis
     usePolling: env.VITEST === "true",
   });
   let refreshChain: Promise<WatchPlan> = Promise.resolve(currentPlan);
+  let configChangedSinceLastCycle = false;
   const applyPlan = async (nextPlan: WatchPlan) => {
     const current = new Set(currentPlan.targets);
     const next = new Set(nextPlan.targets);
@@ -187,12 +267,25 @@ export async function startBackupWatch(options: StartBackupWatchOptions): Promis
     return refreshChain;
   };
   const runner = new DebouncedRunner(options.debounceMs ?? DEFAULT_DEBOUNCE_MS, async () => {
+    const configChangedForCycle = configChangedSinceLastCycle;
+    configChangedSinceLastCycle = false;
     try {
       await queueRefresh();
+      let restoredBackup = false;
       if (options.selfHeal) {
-        await runSelfHealWatchCycle(options, effectiveEnv, log, error);
+        restoredBackup = await runSelfHealWatchCycle(options, effectiveEnv, log, error);
       } else {
         await runBackupOnlyWatchCycle(options, effectiveEnv, log);
+      }
+      if (!configChangedForCycle || restoredBackup) {
+        await ensureGatewayPhoenix({
+          env: effectiveEnv,
+          error,
+          gatewayPort: options.gatewayPort ?? DEFAULT_GATEWAY_PORT,
+          log,
+          openclawBin: options.openclawBin,
+          probeGatewayPort: options.probeGatewayPort,
+        });
       }
     } catch (backupError) {
       error(`${options.selfHeal ? "self-heal" : "backup"} cycle failed: ${String(backupError)}`);
@@ -206,6 +299,7 @@ export async function startBackupWatch(options: StartBackupWatchOptions): Promis
       changedPath &&
       normalizePathKey(String(changedPath)) === normalizePathKey(currentPlan.rootConfigPath)
     ) {
+      configChangedSinceLastCycle = true;
       void queueRefresh();
     }
     runner.trigger();
@@ -217,8 +311,8 @@ export async function startBackupWatch(options: StartBackupWatchOptions): Promis
   log(`output directory: ${shortenHomePath(options.outputDir, effectiveEnv)}`);
   log(`watch mode: ${options.selfHeal ? "self-heal" : "backup-only"}`);
   const close = async () => {
-    runner.close();
     await watcher.close();
+    await runner.close();
     closedResolver();
   };
   options.signal?.addEventListener("abort", () => {

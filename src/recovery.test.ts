@@ -57,13 +57,17 @@ import path from "node:path";
 const args = process.argv.slice(2);
 if (args[0] === "backup" && args[1] === "create") {
   const queue = JSON.parse(await fs.readFile(${JSON.stringify(options.archiveQueuePath)}, "utf8"));
-  const nextArchive = queue.shift();
-  await fs.writeFile(${JSON.stringify(options.archiveQueuePath)}, JSON.stringify(queue), "utf8");
+  const onlyConfig = args.includes("--only-config");
+  const nextArchive = queue[0];
+  if (!onlyConfig) {
+    queue.shift();
+    await fs.writeFile(${JSON.stringify(options.archiveQueuePath)}, JSON.stringify(queue), "utf8");
+  }
   const outputDir = args[args.indexOf("--output") + 1];
   await fs.mkdir(outputDir, { recursive: true });
   const target = path.join(outputDir, path.basename(nextArchive));
   await fs.copyFile(nextArchive, target);
-  console.log(JSON.stringify({ archivePath: target, createdAt: "2026-03-09T00:00:00.000Z" }));
+  console.log(JSON.stringify({ archivePath: target, createdAt: "2026-03-09T00:00:00.000Z", onlyConfig }));
   process.exit(0);
 }
 if (args[0] === "backup" && args[1] === "verify") {
@@ -146,6 +150,7 @@ describe("runPhoenixRecovery", () => {
     expect(result.ok).toBe(true);
     expect(result.health).toEqual({ healthy: true, reason: "gateway reachable" });
     expect(result.backup.archivePath).toContain(`${archiveRoot}.tar.gz`);
+    expect(result.backup.configOnlyArchivePath).toContain(path.join("config-only", `${archiveRoot}.tar.gz`));
     expect(result.knownGood.currentArchivePath).toBe(result.backup.archivePath);
     expect(result.knownGood.promotedArchivePath).toBe(result.backup.archivePath);
     expect(result.notifications).toEqual([]);
@@ -160,10 +165,13 @@ describe("runPhoenixRecovery", () => {
     expect(snapshot.overview.latestAction).toMatchObject({ origin: "manual", operation: "recovery-cycle", status: "ok" });
     expect(snapshot.overview.latestHealth?.result).toEqual({ attempted: true, healthy: true, reason: "gateway reachable" });
     expect(snapshot.config.origins.manual).toMatchObject({ outputDir, retain: 1, notification: { policy: "off" } });
-    expect(snapshot.archives.archives[0]).toMatchObject({
-      archivePath: result.backup.archivePath,
-      roles: expect.arrayContaining(["latest-known-good", "last-backup"]),
-    });
+    expect(snapshot.archives.archives).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        archivePath: result.backup.archivePath,
+        roles: expect.arrayContaining(["latest-known-good", "last-backup"]),
+      }),
+    ]));
+    expect(snapshot.archives.archives.some((entry) => entry.archivePath === result.backup.configOnlyArchivePath)).toBe(true);
   });
 
   it("rolls back to the previous known-good archive and protects it during retention", async () => {
@@ -266,14 +274,15 @@ describe("runPhoenixRecovery", () => {
     expect(second.notifications[0]?.message).toContain("rolled back");
     expect(JSON.parse(await fs.readFile(liveConfigPath, "utf8"))).toEqual({ version: "healthy" });
     expect(await fs.readFile(restoreMarkerPath, "utf8")).toContain(`${healthyArchiveRoot}.tar.gz`);
-    expect(second.retention.kept).toHaveLength(2);
+    expect(second.retention.kept).toHaveLength(3);
     expect(second.retention.kept).toEqual(
       expect.arrayContaining([
         first.knownGood.currentArchivePath as string,
         second.backup.archivePath as string,
+        second.backup.configOnlyArchivePath as string,
       ]),
     );
-    expect(second.retention.deleted).toEqual([]);
+    expect(second.retention.deleted).toEqual([first.backup.configOnlyArchivePath as string]);
     expect(second.notificationDelivery.results).toEqual([
       {
         attempted: false,

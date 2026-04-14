@@ -1,5 +1,6 @@
 import fs from "node:fs/promises";
 import path from "node:path";
+import { resolveConfigOnlyBackupOutputDir } from "./backup.js";
 
 export const OPENCLAW_BACKUP_ARCHIVE_SUFFIX = "-openclaw-backup.tar.gz";
 
@@ -44,4 +45,20 @@ export async function pruneBackupArchives(options: {
     .filter((archivePath) => !kept.has(archivePath));
   await Promise.all(deleted.map((archivePath) => fs.rm(archivePath, { force: true })));
   return { kept: keptList, deleted };
+}
+
+export async function prunePhoenixBackupArchives(options: {
+  directory: string;
+  retain: number;
+  keep?: string[];
+}): Promise<RetentionResult> {
+  const full = await pruneBackupArchives(options);
+  const configOnly = await pruneBackupArchives({
+    directory: resolveConfigOnlyBackupOutputDir(options.directory),
+    retain: options.retain,
+  });
+  return {
+    kept: [...full.kept, ...configOnly.kept],
+    deleted: [...full.deleted, ...configOnly.deleted],
+  };
 }

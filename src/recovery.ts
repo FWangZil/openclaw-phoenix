@@ -1,6 +1,6 @@
 import fs from "node:fs/promises";
 import path from "node:path";
-import { runOpenClawBackupCreate, runOpenClawStatus } from "./backup.js";
+import { runOpenClawBackupCreateBatch, runOpenClawStatus } from "./backup.js";
 import { evaluateOpenClawStatusHealth } from "./health.js";
 import {
   dispatchPhoenixNotifications,
@@ -10,7 +10,7 @@ import {
   type PhoenixRecoveryNotificationEvent,
 } from "./notify.js";
 import { readPhoenixRecoveryState, type PhoenixRecoveryState, writePhoenixRecoveryState } from "./recovery-state.js";
-import { pruneBackupArchives, type RetentionResult } from "./retention.js";
+import { prunePhoenixBackupArchives, type RetentionResult } from "./retention.js";
 import { restoreBackupArchive } from "./restore.js";
 import { recordPhoenixRecoveryAction, type PhoenixActionResult, type PhoenixWebOrigin } from "./web-contract.js";
 
@@ -32,6 +32,7 @@ export type PhoenixRecoveryResult = {
   backup: {
     attempted: true;
     archivePath?: string;
+    configOnlyArchivePath?: string;
     error?: string;
   };
   health: {
@@ -94,14 +95,17 @@ export async function runPhoenixRecovery(options: PhoenixRecoveryRequest): Promi
   const previousKnownGoodArchivePath = state.latestKnownGoodArchivePath;
 
   let backupArchivePath: string | undefined;
+  let configOnlyArchivePath: string | undefined;
   let backupError: string | undefined;
   try {
-    const backup = await runOpenClawBackupCreate({
+    const backup = await runOpenClawBackupCreateBatch({
       openclawBin: options.openclawBin,
       outputDir: options.outputDir,
       env: effectiveEnv,
     });
     backupArchivePath = backup.archivePath ? path.resolve(backup.archivePath) : undefined;
+    configOnlyArchivePath = backup.configOnlyArchivePath ? path.resolve(backup.configOnlyArchivePath) : undefined;
+    backupError = backup.error;
   } catch (error) {
     backupError = String(error);
   }
@@ -164,7 +168,7 @@ export async function runPhoenixRecovery(options: PhoenixRecoveryRequest): Promi
   state.updatedAt = new Date().toISOString();
   await writePhoenixRecoveryState(options.outputDir, state);
 
-  const retention = await pruneBackupArchives({
+  const retention = await prunePhoenixBackupArchives({
     directory: options.outputDir,
     retain: options.retain,
     keep: state.latestKnownGoodArchivePath ? [state.latestKnownGoodArchivePath] : undefined,
@@ -199,6 +203,7 @@ export async function runPhoenixRecovery(options: PhoenixRecoveryRequest): Promi
       backup: {
         attempted: true,
         archivePath: backupArchivePath,
+        configOnlyArchivePath,
         error: backupError,
       },
       health,
@@ -219,6 +224,7 @@ export async function runPhoenixRecovery(options: PhoenixRecoveryRequest): Promi
     backup: {
       attempted: true,
       archivePath: backupArchivePath,
+      configOnlyArchivePath,
       error: backupError,
     },
     health,

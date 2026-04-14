@@ -1,9 +1,34 @@
+import path from "node:path";
 import { spawn } from "node:child_process";
 
 type BackupCreateResult = {
   archivePath?: string;
   createdAt?: string;
+  onlyConfig?: boolean;
 };
+
+export type OpenClawBackupVariant = "full" | "config-only";
+
+export type OpenClawCreatedBackup = {
+  archivePath: string;
+  createdAt?: string;
+  onlyConfig: boolean;
+  variant: OpenClawBackupVariant;
+};
+
+export type OpenClawBackupBatchResult = {
+  archivePath?: string;
+  configOnlyArchivePath?: string;
+  full?: OpenClawCreatedBackup;
+  configOnly?: OpenClawCreatedBackup;
+  error?: string;
+};
+
+export const CONFIG_ONLY_BACKUP_DIRNAME = "config-only";
+
+export function resolveConfigOnlyBackupOutputDir(outputDir: string): string {
+  return path.join(outputDir, CONFIG_ONLY_BACKUP_DIRNAME);
+}
 
 export type OpenClawStatusResult = {
   gateway?: {
@@ -24,12 +49,12 @@ export type BackupVerifyResult = {
   entryCount: number;
 };
 
-export async function runOpenClawJsonCommand(options: {
+export async function runOpenClawCommand(options: {
   openclawBin: string;
   args: string[];
   env?: NodeJS.ProcessEnv;
   label: string;
-}): Promise<string> {
+}): Promise<{ stdoutText: string; stderrText: string }> {
   const stdout: string[] = [];
   const stderr: string[] = [];
   const child = spawn(options.openclawBin, options.args, {
@@ -55,6 +80,16 @@ export async function runOpenClawJsonCommand(options: {
       `${options.label} failed with exit ${exitCode}${stderrText ? `: ${stderrText}` : stdoutText ? `: ${stdoutText}` : ""}`,
     );
   }
+  return { stdoutText, stderrText };
+}
+
+export async function runOpenClawJsonCommand(options: {
+  openclawBin: string;
+  args: string[];
+  env?: NodeJS.ProcessEnv;
+  label: string;
+}): Promise<string> {
+  const { stdoutText } = await runOpenClawCommand(options);
   return stdoutText;
 }
 
@@ -62,21 +97,85 @@ export async function runOpenClawBackupCreate(options: {
   openclawBin: string;
   outputDir: string;
   env?: NodeJS.ProcessEnv;
+  onlyConfig?: boolean;
 }): Promise<BackupCreateResult> {
+  const onlyConfig = Boolean(options.onlyConfig);
   const stdoutText = await runOpenClawJsonCommand({
     openclawBin: options.openclawBin,
-    args: ["backup", "create", "--output", options.outputDir, "--json"],
+    args: ["backup", "create", "--output", options.outputDir, ...(onlyConfig ? ["--only-config"] : []), "--json"],
     env: options.env,
-    label: "openclaw backup create",
+    label: onlyConfig ? "openclaw backup create --only-config" : "openclaw backup create",
   });
   if (!stdoutText) {
-    return {};
+    return { onlyConfig };
   }
   try {
-    return JSON.parse(stdoutText) as BackupCreateResult;
+    return {
+      ...(JSON.parse(stdoutText) as BackupCreateResult),
+      onlyConfig,
+    };
   } catch {
-    return {};
+    return { onlyConfig };
   }
+}
+
+function toCreatedBackup(result: BackupCreateResult, variant: OpenClawBackupVariant): OpenClawCreatedBackup | undefined {
+  if (!result.archivePath) {
+    return undefined;
+  }
+  return {
+    archivePath: path.resolve(result.archivePath),
+    createdAt: result.createdAt,
+    onlyConfig: variant === "config-only",
+    variant,
+  };
+}
+
+export async function runOpenClawBackupCreateBatch(options: {
+  openclawBin: string;
+  outputDir: string;
+  env?: NodeJS.ProcessEnv;
+}): Promise<OpenClawBackupBatchResult> {
+  const errors: string[] = [];
+  let configOnly: OpenClawCreatedBackup | undefined;
+  let full: OpenClawCreatedBackup | undefined;
+
+  try {
+    const result = await runOpenClawBackupCreate({
+      openclawBin: options.openclawBin,
+      outputDir: resolveConfigOnlyBackupOutputDir(options.outputDir),
+      env: options.env,
+      onlyConfig: true,
+    });
+    configOnly = toCreatedBackup(result, "config-only");
+    if (!configOnly) {
+      errors.push("config-only backup returned no archive path");
+    }
+  } catch (error) {
+    errors.push(`config-only backup failed: ${String(error)}`);
+  }
+
+  try {
+    const result = await runOpenClawBackupCreate({
+      openclawBin: options.openclawBin,
+      outputDir: options.outputDir,
+      env: options.env,
+    });
+    full = toCreatedBackup(result, "full");
+    if (!full) {
+      errors.push("full backup returned no archive path");
+    }
+  } catch (error) {
+    errors.push(`full backup failed: ${String(error)}`);
+  }
+
+  return {
+    archivePath: full?.archivePath,
+    configOnlyArchivePath: configOnly?.archivePath,
+    full,
+    configOnly,
+    error: errors.length > 0 ? errors.join("; ") : undefined,
+  };
 }
 
 export async function runOpenClawBackupVerify(options: {

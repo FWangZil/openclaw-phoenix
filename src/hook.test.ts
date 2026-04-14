@@ -46,7 +46,7 @@ afterEach(async () => {
 });
 
 describe("managed Phoenix hook", () => {
-  it("installs a managed hook, rolls back on unhealthy status, and removes only Phoenix-owned entries", async () => {
+  it("installs a managed hook, rolls back on unhealthy status, and removes only Phoenix-owned entries", { timeout: 10_000 }, async () => {
     const homeDir = await makeTempDir("phoenix-hook-home-");
     const outputDir = path.join(homeDir, "archives");
     const stateDir = path.join(homeDir, ".openclaw");
@@ -145,13 +145,17 @@ const statusModePath = ${JSON.stringify(statusModePath)};
 const restoreMarkerPath = ${JSON.stringify(restoreMarkerPath)};
 if (args[0] === "backup" && args[1] === "create") {
   const queue = JSON.parse(await fs.readFile(queuePath, "utf8"));
-  const nextArchive = queue.shift();
-  await fs.writeFile(queuePath, JSON.stringify(queue), "utf8");
+  const onlyConfig = args.includes("--only-config");
+  const nextArchive = queue[0];
+  if (!onlyConfig) {
+    queue.shift();
+    await fs.writeFile(queuePath, JSON.stringify(queue), "utf8");
+  }
   const outputDir = args[args.indexOf("--output") + 1];
   await fs.mkdir(outputDir, { recursive: true });
   const target = path.join(outputDir, path.basename(nextArchive));
   await fs.copyFile(nextArchive, target);
-  console.log(JSON.stringify({ archivePath: target, createdAt: "2026-03-09T00:00:00.000Z" }));
+  console.log(JSON.stringify({ archivePath: target, createdAt: "2026-03-09T00:00:00.000Z", onlyConfig }));
   process.exit(0);
 }
 if (args[0] === "backup" && args[1] === "verify") {

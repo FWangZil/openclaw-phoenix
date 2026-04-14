@@ -1,0 +1,25 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>OpenClaw Phoenix Console</title>
+    <script>
+      (() => {
+        try {
+          const locale = window.localStorage.getItem("phoenix-console-locale") || "en";
+          const theme = window.localStorage.getItem("phoenix-console-theme") || "dark";
+          document.documentElement.lang = locale;
+          document.documentElement.dataset.theme = theme;
+        } catch {
+          document.documentElement.lang = "en";
+          document.documentElement.dataset.theme = "dark";
+        }
+      })();
+    </script>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+  </html>

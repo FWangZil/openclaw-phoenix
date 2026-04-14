@@ -7,6 +7,6 @@ export default defineConfig({
   root: rootDir,
   test: {
     environment: "node",
-    include: ["src/**/*.test.ts"],
+    include: ["src/**/*.test.ts", "web/src/**/*.test.ts", "web/src/**/*.test.tsx"],
   },
 });

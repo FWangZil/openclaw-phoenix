@@ -1,0 +1,231 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(bun add:*)",
+      "Bash(bun run:*)",
+      "Bash(cd /Users/wang/workspace/projects/openclaw/openclaw-phoenix/web && npm run build 2>&1 | head -50)",
+      "Bash(cd /Users/wang/workspace/projects/openclaw/openclaw-phoenix/web && npm run build 2>&1 | head -30)",
+      "Bash(npm run:*)"
+    ]
+  },
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash|Write|Edit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/Users/wang/workspace/tools/agenthive/orchestrator/routers/../hooks/pretooluse-safety.py"
+          }
+        ]
+      },
+      {
+        "hooks": [
+          {
+            "type": "http",
+            "url": "http://localhost:3456/api/hooks/agent-tool-activity",
+            "headers": {
+              "X-Agent-Id": "$AHIVE_AGENT_ID"
+            },
+            "allowedEnvVars": [
+              "AHIVE_AGENT_ID"
+            ]
+          }
+        ]
+      },
+      {
+        "hooks": [
+          {
+            "type": "http",
+            "url": "http://localhost:3456/api/hooks/agent-permission",
+            "headers": {
+              "X-Agent-Id": "$AHIVE_AGENT_ID"
+            },
+            "allowedEnvVars": [
+              "AHIVE_AGENT_ID"
+            ],
+            "timeout": 86400
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "hooks": [
+          {
+            "type": "http",
+            "url": "http://localhost:3456/api/hooks/agent-tool-activity",
+            "headers": {
+              "X-Agent-Id": "$AHIVE_AGENT_ID"
+            },
+            "allowedEnvVars": [
+              "AHIVE_AGENT_ID"
+            ]
+          }
+        ]
+      }
+    ],
+    "PostToolUseFailure": [
+      {
+        "hooks": [
+          {
+            "type": "http",
+            "url": "http://localhost:3456/api/hooks/agent-tool-activity",
+            "headers": {
+              "X-Agent-Id": "$AHIVE_AGENT_ID"
+            },
+            "allowedEnvVars": [
+              "AHIVE_AGENT_ID"
+            ]
+          }
+        ]
+      }
+    ],
+    "SubagentStart": [
+      {
+        "hooks": [
+          {
+            "type": "http",
+            "url": "http://localhost:3456/api/hooks/agent-tool-activity",
+            "headers": {
+              "X-Agent-Id": "$AHIVE_AGENT_ID"
+            },
+            "allowedEnvVars": [
+              "AHIVE_AGENT_ID"
+            ]
+          }
+        ]
+      }
+    ],
+    "SubagentStop": [
+      {
+        "hooks": [
+          {
+            "type": "http",
+            "url": "http://localhost:3456/api/hooks/agent-tool-activity",
+            "headers": {
+              "X-Agent-Id": "$AHIVE_AGENT_ID"
+            },
+            "allowedEnvVars": [
+              "AHIVE_AGENT_ID"
+            ]
+          }
+        ]
+      }
+    ],
+    "Notification": [
+      {
+        "matcher": "permission_prompt",
+        "hooks": [
+          {
+            "type": "http",
+            "url": "http://localhost:3456/api/hooks/agent-tool-activity",
+            "headers": {
+              "X-Agent-Id": "$AHIVE_AGENT_ID"
+            },
+            "allowedEnvVars": [
+              "AHIVE_AGENT_ID"
+            ]
+          }
+        ]
+      }
+    ],
+    "PreCompact": [
+      {
+        "hooks": [
+          {
+            "type": "http",
+            "url": "http://localhost:3456/api/hooks/agent-tool-activity",
+            "headers": {
+              "X-Agent-Id": "$AHIVE_AGENT_ID"
+            },
+            "allowedEnvVars": [
+              "AHIVE_AGENT_ID"
+            ]
+          }
+        ]
+      }
+    ],
+    "PostCompact": [
+      {
+        "hooks": [
+          {
+            "type": "http",
+            "url": "http://localhost:3456/api/hooks/agent-post-compact",
+            "headers": {
+              "X-Agent-Id": "$AHIVE_AGENT_ID"
+            },
+            "allowedEnvVars": [
+              "AHIVE_AGENT_ID"
+            ]
+          }
+        ]
+      }
+    ],
+    "PermissionRequest": [
+      {
+        "hooks": [
+          {
+            "type": "http",
+            "url": "http://localhost:3456/api/hooks/agent-permission-request",
+            "headers": {
+              "X-Agent-Id": "$AHIVE_AGENT_ID"
+            },
+            "allowedEnvVars": [
+              "AHIVE_AGENT_ID"
+            ],
+            "timeout": 86400
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "http",
+            "url": "http://localhost:3456/api/hooks/agent-stop",
+            "headers": {
+              "X-Agent-Id": "$AHIVE_AGENT_ID"
+            },
+            "allowedEnvVars": [
+              "AHIVE_AGENT_ID"
+            ]
+          }
+        ]
+      }
+    ],
+    "SessionEnd": [
+      {
+        "hooks": [
+          {
+            "type": "http",
+            "url": "http://localhost:3456/api/hooks/agent-session-end",
+            "headers": {
+              "X-Agent-Id": "$AHIVE_AGENT_ID"
+            },
+            "allowedEnvVars": [
+              "AHIVE_AGENT_ID"
+            ]
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "http",
+            "url": "http://localhost:3456/api/hooks/agent-user-prompt",
+            "headers": {
+              "X-Agent-Id": "$AHIVE_AGENT_ID"
+            },
+            "allowedEnvVars": [
+              "AHIVE_AGENT_ID"
+            ]
+          }
+        ]
+      }
+    ]
+  }
+}

@@ -52,6 +52,7 @@ async function createFakeOpenClaw(options: {
   verifyArchiveRoot: string;
   notificationLogPath?: string;
   notificationModePath?: string;
+  gatewayStartFailuresPath?: string;
 }) {
   const scriptPath = path.join(options.homeDir, "fake-openclaw.mjs");
   await writeExecutableScript(
@@ -67,8 +68,12 @@ const appendLog = async (line) => {
 if (args[0] === "backup" && args[1] === "create") {
   await appendLog("backup create");
   const queue = JSON.parse(await fs.readFile(${JSON.stringify(options.archiveQueuePath)}, "utf8"));
-  const nextArchive = queue.shift();
-  await fs.writeFile(${JSON.stringify(options.archiveQueuePath)}, JSON.stringify(queue), "utf8");
+  const onlyConfig = args.includes("--only-config");
+  const nextArchive = queue[0];
+  if (!onlyConfig) {
+    queue.shift();
+    await fs.writeFile(${JSON.stringify(options.archiveQueuePath)}, JSON.stringify(queue), "utf8");
+  }
   if (!nextArchive) {
     console.error("no queued archive available");
     process.exit(1);
@@ -77,7 +82,7 @@ if (args[0] === "backup" && args[1] === "create") {
   await fs.mkdir(outputDir, { recursive: true });
   const target = path.join(outputDir, path.basename(nextArchive));
   await fs.copyFile(nextArchive, target);
-  console.log(JSON.stringify({ archivePath: target, createdAt: "2026-03-09T00:00:00.000Z" }));
+  console.log(JSON.stringify({ archivePath: target, createdAt: "2026-03-09T00:00:00.000Z", onlyConfig }));
   process.exit(0);
 }
 if (args[0] === "backup" && args[1] === "verify") {
@@ -110,6 +115,26 @@ if (args[0] === "gateway" && args[1] === "call" && args[2] === "send") {
   const params = JSON.parse(args[args.indexOf("--params") + 1]);
   ${options.notificationLogPath ? `await fs.appendFile(${JSON.stringify(options.notificationLogPath)}, JSON.stringify(params) + "\\n", "utf8");` : ""}
   console.log(JSON.stringify({ ok: true }));
+  process.exit(0);
+}
+if (args[0] === "gateway" && args[1] === "start") {
+  await appendLog("gateway start");
+  ${
+    options.gatewayStartFailuresPath
+      ? `const failuresRemaining = Number.parseInt((await fs.readFile(${JSON.stringify(options.gatewayStartFailuresPath)}, "utf8")).trim() || "0", 10);
+  if (Number.isFinite(failuresRemaining) && failuresRemaining > 0) {
+    await fs.writeFile(${JSON.stringify(options.gatewayStartFailuresPath)}, String(failuresRemaining - 1), "utf8");
+    console.error("gateway start failed");
+    process.exit(1);
+  }`
+      : ""
+  }
+  console.log("gateway started");
+  process.exit(0);
+}
+if (args[0] === "gateway" && args[1] === "install") {
+  await appendLog("gateway install");
+  console.log("gateway installed");
   process.exit(0);
 }
 console.error("unexpected fake openclaw args: " + args.join(" "));
@@ -201,16 +226,17 @@ describe("startBackupWatch", () => {
           to: "room://operators",
         },
       },
-      log: (message) => logs.push(message),
+      log: (message: string) => logs.push(message),
     });
     sessions.push(session);
 
     await new Promise((resolve) => setTimeout(resolve, 150));
     await rewriteConfig(configPath, 1);
-    await waitFor(async () => (await readCommandLog(commandLogPath)).includes("backup create"));
+    await waitFor(async () => (await readCommandLog(commandLogPath)).filter((entry) => entry === "backup create").length === 2);
 
-    expect(await readCommandLog(commandLogPath)).toEqual(["backup create"]);
+    expect((await readCommandLog(commandLogPath)).filter((entry) => entry === "backup create")).toHaveLength(2);
     expect(await fileExists(path.join(outputDir, ".openclaw-phoenix-state.json"))).toBe(false);
+    expect(await fileExists(path.join(outputDir, "config-only", `${archiveRoot}.tar.gz`))).toBe(true);
     expect(await fileExists(notificationLogPath)).toBe(false);
     expect(logs).toContain("watch mode: backup-only");
     await waitFor(async () => {
@@ -231,6 +257,70 @@ describe("startBackupWatch", () => {
     expect(snapshot.overview.latestAction).toMatchObject({ origin: "watch", operation: "backup-cycle", status: "ok" });
     expect(snapshot.overview.latestHealth).toBeUndefined();
     expect(snapshot.config.origins.watch).toMatchObject({ selfHeal: false, retain: 1, notification: { policy: "off" } });
+  }, 15_000);
+
+  it("restarts gateway after a non-config watch cycle when the local gateway port is down", async () => {
+    const homeDir = await makeTempDir("phoenix-watch-gateway-restart-");
+    const stateDir = path.join(homeDir, ".openclaw");
+    const outputDir = path.join(homeDir, "archives");
+    const oauthDir = path.join(stateDir, "credentials");
+    const configPath = path.join(stateDir, "openclaw.json");
+    await fs.mkdir(oauthDir, { recursive: true });
+    await rewriteConfig(configPath, 0);
+    const archiveRoot = "2026-03-11T00-00-00.000Z-openclaw-backup";
+    const sourceStateDir = path.join("/tmp", "phoenix-watch-gateway-restart-source");
+    const archivePath = await buildArchiveFixture({
+      archiveRoot,
+      manifest: {
+        schemaVersion: 1,
+        archiveRoot,
+        createdAt: "2026-03-11T00:00:00.000Z",
+        paths: { stateDir: sourceStateDir },
+        assets: [],
+      },
+      files: [],
+    });
+    const archiveQueuePath = path.join(homeDir, "archive-queue.json");
+    const statusModePath = path.join(homeDir, "status-mode.txt");
+    const restoreMarkerPath = path.join(homeDir, "restore-marker.txt");
+    const commandLogPath = path.join(homeDir, "command-log.txt");
+    const gatewayStartFailuresPath = path.join(homeDir, "gateway-start-failures.txt");
+    await fs.writeFile(archiveQueuePath, JSON.stringify([archivePath]), "utf8");
+    await fs.writeFile(statusModePath, "healthy", "utf8");
+    await fs.writeFile(gatewayStartFailuresPath, "0", "utf8");
+    const openclawBin = await createFakeOpenClaw({
+      homeDir,
+      archiveQueuePath,
+      statusModePath,
+      restoreMarkerPath,
+      commandLogPath,
+      verifyArchiveRoot: archiveRoot,
+      gatewayStartFailuresPath,
+    });
+
+    const logs: string[] = [];
+    const watchOptions = {
+      configPath,
+      debounceMs: 40,
+      env: { ...process.env, HOME: homeDir, OPENCLAW_STATE_DIR: stateDir, VITEST: "true" },
+      openclawBin,
+      outputDir,
+      retain: 1,
+      log: (message: string) => logs.push(message),
+      probeGatewayPort: async () => false,
+    };
+    const session = await startBackupWatch(watchOptions);
+    sessions.push(session);
+
+    await new Promise((resolve) => setTimeout(resolve, 150));
+    await fs.writeFile(path.join(oauthDir, "session.json"), JSON.stringify({ updatedAt: Date.now() }), "utf8");
+    await waitFor(async () => (await readCommandLog(commandLogPath)).includes("gateway start"));
+
+    const commandLog = await readCommandLog(commandLogPath);
+    expect(commandLog).toEqual(expect.arrayContaining(["backup create", "gateway start"]));
+    expect(commandLog.filter((entry) => entry === "gateway start")).toHaveLength(1);
+    expect(commandLog).not.toContain("gateway install");
+    expect(logs).toContain("watch mode: backup-only");
   }, 15_000);
 
   it("dispatches all-policy healthy notifications when watch self-heal is enabled", async () => {
@@ -287,7 +377,7 @@ describe("startBackupWatch", () => {
           threadId: "watch-thread",
         },
       },
-      log: (message) => logs.push(message),
+      log: (message: string) => logs.push(message),
     });
     sessions.push(session);
 
@@ -297,6 +387,7 @@ describe("startBackupWatch", () => {
 
     const commandLog = await readCommandLog(commandLogPath);
     expect(commandLog).toEqual(expect.arrayContaining(["backup create", "status", "gateway call send"]));
+    expect(commandLog.filter((entry) => entry === "backup create")).toHaveLength(2);
     expect(await fileExists(path.join(outputDir, ".openclaw-phoenix-state.json"))).toBe(true);
     expect(logs).toContain("watch mode: self-heal");
 
@@ -375,7 +466,7 @@ describe("startBackupWatch", () => {
           to: "room://operators",
         },
       },
-      log: (message) => logs.push(message),
+      log: (message: string) => logs.push(message),
       error: (message) => errors.push(message),
     });
     sessions.push(session);
@@ -389,7 +480,7 @@ describe("startBackupWatch", () => {
     await waitFor(async () => await fileExists(notificationLogPath));
 
     const commandLog = await readCommandLog(commandLogPath);
-    expect(commandLog.filter((entry) => entry === "backup create")).toHaveLength(2);
+    expect(commandLog.filter((entry) => entry === "backup create")).toHaveLength(4);
     expect(commandLog.filter((entry) => entry === "status")).toHaveLength(2);
     expect(commandLog.filter((entry) => entry === "gateway call send")).toHaveLength(2);
     expect(errors.some((entry) => entry.includes("notification delivery failed (healthy)"))).toBe(true);
@@ -465,8 +556,10 @@ describe("startBackupWatch", () => {
     const statusModePath = path.join(homeDir, "status-mode.txt");
     const restoreMarkerPath = path.join(homeDir, "restore-marker.txt");
     const commandLogPath = path.join(homeDir, "command-log.txt");
+    const gatewayStartFailuresPath = path.join(homeDir, "gateway-start-failures.txt");
     await fs.writeFile(archiveQueuePath, JSON.stringify([healthyArchive, unhealthyArchive]), "utf8");
     await fs.writeFile(statusModePath, "healthy", "utf8");
+    await fs.writeFile(gatewayStartFailuresPath, "1", "utf8");
     const openclawBin = await createFakeOpenClaw({
       homeDir,
       archiveQueuePath,
@@ -474,9 +567,10 @@ describe("startBackupWatch", () => {
       restoreMarkerPath,
       commandLogPath,
       verifyArchiveRoot: healthyArchiveRoot,
+      gatewayStartFailuresPath,
     });
     const logs: string[] = [];
-    const session = await startBackupWatch({
+    const watchOptions = {
       configPath,
       debounceMs: 40,
       env: { ...process.env, HOME: homeDir, OPENCLAW_STATE_DIR: stateDir, VITEST: "true" },
@@ -484,8 +578,10 @@ describe("startBackupWatch", () => {
       outputDir,
       retain: 1,
       selfHeal: true,
-      log: (message) => logs.push(message),
-    });
+      log: (message: string) => logs.push(message),
+      probeGatewayPort: async () => false,
+    };
+    const session = await startBackupWatch(watchOptions);
     sessions.push(session);
 
     await new Promise((resolve) => setTimeout(resolve, 150));
@@ -500,18 +596,28 @@ describe("startBackupWatch", () => {
     await rewriteConfig(configPath, 2);
     await waitFor(async () => {
       const liveConfig = await fs.readFile(liveConfigPath, "utf8").catch(() => "");
+      const commandLog = await readCommandLog(commandLogPath);
       return (
         liveConfig.includes('"healthy"') &&
         (await fileExists(restoreMarkerPath)) &&
+        commandLog.filter((entry) => entry === "gateway start").length >= 2 &&
+        commandLog.includes("gateway install") &&
         logs.some((entry) => entry.includes("rolled back"))
       );
     });
 
     expect(JSON.parse(await fs.readFile(liveConfigPath, "utf8"))).toEqual({ version: "healthy" });
     expect(await fs.readFile(restoreMarkerPath, "utf8")).toContain(`${healthyArchiveRoot}.tar.gz`);
-    expect(await readCommandLog(commandLogPath)).toEqual(
-      expect.arrayContaining(["backup create", "status", "backup verify"]),
-    );
+    const commandLog = await readCommandLog(commandLogPath);
+    expect(commandLog).toEqual(expect.arrayContaining([
+      "backup create",
+      "status",
+      "backup verify",
+      "gateway start",
+      "gateway install",
+    ]));
+    expect(commandLog.filter((entry) => entry === "gateway start")).toHaveLength(2);
+    expect(commandLog.filter((entry) => entry === "gateway install")).toHaveLength(1);
     expect(logs.some((entry) => entry.includes("rolled back"))).toBe(true);
     expect(logs).toContain("watch mode: self-heal");
   }, 15_000);
@@ -571,7 +677,7 @@ describe("startBackupWatch", () => {
       outputDir,
       retain: 2,
       selfHeal: true,
-      log: (message) => logs.push(message),
+      log: (message: string) => logs.push(message),
     });
     sessions.push(session);
 
@@ -583,11 +689,11 @@ describe("startBackupWatch", () => {
     await rewriteConfig(configPath, 2);
     await waitFor(async () => {
       const raw = await fs.readFile(path.join(outputDir, ".openclaw-phoenix-state.json"), "utf8").catch(() => "");
-      return raw.includes(`${secondArchiveRoot}.tar.gz`);
+      return raw.includes(`${secondArchiveRoot}.tar.gz`) && logs.some((entry) => entry.includes("latest-known-good updated"));
     });
 
     const commandLog = await readCommandLog(commandLogPath);
-    expect(commandLog.filter((entry) => entry === "backup create")).toHaveLength(2);
+    expect(commandLog.filter((entry) => entry === "backup create")).toHaveLength(4);
     expect(commandLog.filter((entry) => entry === "status")).toHaveLength(2);
     expect(logs.some((entry) => entry.includes("latest-known-good updated"))).toBe(true);
   }, 15_000);
